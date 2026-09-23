@@ -565,6 +565,17 @@ const (
 	SandboxDiskUsedGaugeName  GaugeIntType = "e2b.sandbox.disk.used"
 	SandboxDiskTotalGaugeName GaugeIntType = "e2b.sandbox.disk.total"
 
+	// Template cache residency. mapping_bytes is the load-bearing one: a
+	// Header's compact Mapping is the largest long-lived allocation the
+	// orchestrator holds, and entry count alone hides its growth because
+	// headers differ in size by orders of magnitude.
+	OrchestratorTemplateCacheEntriesGaugeName        GaugeIntType = "orchestrator.templates.cache.entries"
+	OrchestratorTemplateCachePinnedGaugeName         GaugeIntType = "orchestrator.templates.cache.pinned"
+	OrchestratorTemplateCacheMappingEntriesGaugeName GaugeIntType = "orchestrator.templates.cache.mapping_entries"
+	OrchestratorTemplateCacheMappingBytesGaugeName   GaugeIntType = "orchestrator.templates.cache.mapping_bytes"
+	OrchestratorTemplateCachePinnedRefsGaugeName     GaugeIntType = "orchestrator.templates.cache.pinned_refs"
+	OrchestratorTemplateCacheOldestPinAgeGaugeName   GaugeIntType = "orchestrator.templates.cache.pinned_oldest_age"
+
 	// Team metrics
 	TeamSandboxRunningGaugeName GaugeIntType = "e2b.team.sandbox.running"
 
@@ -771,6 +782,13 @@ var gaugeIntDesc = map[GaugeIntType]string{
 	SandboxDiskTotalGaugeName:            "Amount of disk space available to the sandbox.",
 	TeamSandboxRunningGaugeName:          "The number of sandboxes running for the team in the interval.",
 	SandboxCountGaugeName:                "Number of running sandbox instances per team.",
+
+	OrchestratorTemplateCacheEntriesGaugeName:        "Templates currently resident in the orchestrator's template cache.",
+	OrchestratorTemplateCachePinnedGaugeName:         "Resident templates pinned by at least one live sandbox, and so exempt from eviction.",
+	OrchestratorTemplateCacheMappingEntriesGaugeName: "Total header mapping entries held by resident templates.",
+	OrchestratorTemplateCacheMappingBytesGaugeName:   "Approximate heap bytes held by resident templates' header mappings.",
+	OrchestratorTemplateCachePinnedRefsGaugeName:     "Outstanding template pins, one per holder, so shared builds and leak magnitude are visible.",
+	OrchestratorTemplateCacheOldestPinAgeGaugeName:   "Age of the oldest outstanding template pin. A pin never ages out on its own.",
 }
 
 var gaugeIntUnits = map[GaugeIntType]string{
@@ -794,6 +812,13 @@ var gaugeIntUnits = map[GaugeIntType]string{
 	SandboxDiskTotalGaugeName:            "{By}",
 	TeamSandboxRunningGaugeName:          "{sandbox}",
 	SandboxCountGaugeName:                "{sandbox}",
+
+	OrchestratorTemplateCacheEntriesGaugeName:        "{template}",
+	OrchestratorTemplateCachePinnedGaugeName:         "{template}",
+	OrchestratorTemplateCacheMappingEntriesGaugeName: "{entry}",
+	OrchestratorTemplateCacheMappingBytesGaugeName:   "{By}",
+	OrchestratorTemplateCachePinnedRefsGaugeName:     "{pin}",
+	OrchestratorTemplateCacheOldestPinAgeGaugeName:   "s",
 }
 
 func GetCounter(meter metric.Meter, name CounterType) (metric.Int64Counter, error) {

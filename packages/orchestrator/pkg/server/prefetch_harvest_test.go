@@ -83,10 +83,21 @@ type fakeHarvestTemplates struct {
 	updateErr   error
 	updated     bool
 	updatedMeta metadata.Template
+
+	// pins and releases must balance: a pin the harvest never releases keeps the
+	// template resident for the life of the process.
+	pins     int
+	releases int
 }
 
-func (f *fakeHarvestTemplates) GetTemplate(context.Context, string, bool, bool, ...sbxtemplate.GetTemplateOpts) (sbxtemplate.Template, error) {
-	return nil, f.getErr
+func (f *fakeHarvestTemplates) GetTemplatePinned(context.Context, string, bool, bool, ...sbxtemplate.GetTemplateOpts) (sbxtemplate.Template, func(), error) {
+	if f.getErr != nil {
+		return nil, func() {}, f.getErr
+	}
+
+	f.pins++
+
+	return nil, func() { f.releases++ }, nil
 }
 
 func (f *fakeHarvestTemplates) UpdateMetadata(_ string, meta metadata.Template) error {
@@ -204,6 +215,8 @@ func TestHarvestRun_ConsumePersistsAndReaps(t *testing.T) {
 	require.NotNil(t, p.tmpls.updatedMeta.Prefetch, "persisted metadata must carry the mapping")
 	require.Equal(t, 2, p.tmpls.updatedMeta.Prefetch.Memory.Count(), "the persisted mapping must hold the harvested blocks")
 	require.True(t, p.uploadCalled, "remote metadata must be re-uploaded")
+	require.Equal(t, 1, p.tmpls.pins, "the throwaway runs off the template, so it must be pinned")
+	require.Equal(t, p.tmpls.pins, p.tmpls.releases, "the template pin must be released")
 }
 
 // TestHarvestRun_ThrowawayIdentity checks the throwaway resume runtime: it is
@@ -312,6 +325,8 @@ func TestHarvestRun_CollectErrorStillReaps(t *testing.T) {
 	require.True(t, p.inst.stopped && p.inst.closed, "throwaway must be reaped even when collection fails")
 	require.True(t, p.released)
 	require.False(t, p.tmpls.updated)
+	require.Equal(t, p.tmpls.pins, p.tmpls.releases,
+		"a pin leaked on the error path keeps the template resident for the life of the process")
 }
 
 // TestHarvestRun_AcquireErrorSkips: if the start slot can't be acquired the

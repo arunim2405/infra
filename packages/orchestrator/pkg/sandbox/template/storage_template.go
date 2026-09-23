@@ -290,7 +290,19 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 }
 
 func (t *storageTemplate) Close(ctx context.Context) error {
-	return closeTemplate(ctx, t)
+	err := closeTemplate(ctx, t)
+
+	// closeTemplate only removes the files it holds handles for, which leaves the
+	// metafile and the directory itself behind; nothing else reclaims them, since
+	// the startup sweep covers DefaultCacheDir and these live under
+	// TemplateCacheDir. The directory is private to this instance — CachePaths
+	// mints a fresh identifier per template — so removing it cannot touch another
+	// instance's files.
+	if pathsErr := t.paths.Close(); pathsErr != nil {
+		err = errors.Join(err, fmt.Errorf("failed to remove template cache dir: %w", pathsErr))
+	}
+
+	return err
 }
 
 func (t *storageTemplate) Files() storage.CachePaths {
@@ -338,6 +350,72 @@ func (t *storageTemplate) SchedulingMetadata(ctx context.Context) *orchestrator.
 	}
 
 	return scheduling.FromHeaders(rh.Metadata.BuildId, mh, rh, 0)
+}
+
+// headerFootprint reports the mapping entry count and approximate heap bytes
+// held by this template's resolved headers. It never blocks: the headers live
+// on the memfile/rootfs devices (the header holders stay unset for templates
+// loaded from storage — see SchedulingMetadata), and a device whose SetOnce has
+// not resolved yet is skipped. The gauge therefore undercounts still-fetching
+// templates rather than stalling the metrics callback on them.
+func (t *storageTemplate) headerFootprint() (entries int, bytes int) {
+	// Deduplicated by the mapping's backing storage rather than by header
+	// identity, because one allocation reaches this function by two routes. The
+	// holders below usually resolve to the very headers the devices carry; and
+	// once a snapshot's upload publishes, the device carries a CloneForUpload
+	// while the holder still carries the source — two distinct *Header sharing
+	// one Mapping, since the clone copies the struct and the copy shares its
+	// slices. Counting that allocation twice would overstate the number this
+	// gauge exists to make trustworthy, and it would do so as uploads land,
+	// which reads like retention growth rather than a counting artifact.
+	seen := make(map[*header.Header]struct{}, 4)
+	counted := make([]header.Mapping, 0, 4)
+
+	add := func(h *header.Header) {
+		if h == nil {
+			return
+		}
+		if _, dup := seen[h]; dup {
+			return
+		}
+		seen[h] = struct{}{}
+
+		for _, m := range counted {
+			if m.SharesStorageWith(h.Mapping) {
+				return
+			}
+		}
+		counted = append(counted, h.Mapping)
+
+		entries += h.Mapping.Len()
+		bytes += h.Mapping.ByteSize()
+	}
+
+	if dev, err := t.memfile.Result(); err == nil && dev != nil {
+		add(dev.Header())
+	}
+
+	if dev, err := t.rootfs.Result(); err == nil && dev != nil {
+		add(dev.Header())
+	}
+
+	// The holders are not always the headers the devices ended up on, and the
+	// difference is retained memory. A template built from a provisional memfile
+	// header keeps that header alive in memfileHeader after SwapHeaderIfCurrent
+	// has moved the device on to the deduped one, so a paused-and-deduped
+	// template holds two distinct mappings while the device reports one. Count
+	// every distinct header the template still references.
+	for _, holder := range []*utils.SetOnce[*header.Header]{t.memfileHeader, t.rootfsHeader, t.durableMemfileHeader} {
+		if holder == nil {
+			continue
+		}
+
+		if h, err := holder.Result(); err == nil {
+			add(h)
+		}
+	}
+
+	return entries, bytes
 }
 
 func (t *storageTemplate) Memfile(ctx context.Context) (block.ReadonlyDevice, error) {

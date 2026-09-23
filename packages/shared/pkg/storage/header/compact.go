@@ -135,6 +135,31 @@ func (m Mapping) Len() int { return len(m.offsets) }
 // BlockSize returns the block size used for block<->byte conversions.
 func (m Mapping) BlockSize() uint64 { return m.blockSize }
 
+// ByteSize returns the approximate heap footprint of the mapping's columns, so
+// callers can gauge how much RAM cached headers hold without knowing the
+// encoding. It counts the four parallel columns (4+4+4+2 bytes per entry) plus
+// the deduplicated build table (16 bytes per UUID); it excludes the struct
+// header itself and any slice capacity beyond len.
+func (m Mapping) ByteSize() int {
+	const bytesPerEntry = 4 + 4 + 4 + 2 // offsets, lengths, storage, buildIdx
+
+	return len(m.offsets)*bytesPerEntry + len(m.builds)*16
+}
+
+// SharesStorageWith reports whether m and other are backed by the same columns.
+// Copying a Mapping by value — as Header.CloneForUpload does — shares its
+// slices with the original, so two distinct Headers can hold one allocation
+// between them. Callers measuring heap footprint need this to avoid counting
+// that allocation once per Header. An empty mapping shares nothing: it holds no
+// allocation to confuse.
+func (m Mapping) SharesStorageWith(other Mapping) bool {
+	if len(m.offsets) == 0 || len(other.offsets) == 0 {
+		return false
+	}
+
+	return &m.offsets[0] == &other.offsets[0]
+}
+
 // Builds returns the deduplicated build IDs referenced by the mapping. The
 // returned slice is shared with the Mapping; callers must not mutate it.
 func (m Mapping) Builds() []uuid.UUID { return m.builds }

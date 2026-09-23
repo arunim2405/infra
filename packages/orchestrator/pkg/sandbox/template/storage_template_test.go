@@ -4,6 +4,7 @@ package template
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -79,4 +80,163 @@ func TestStorageTemplate_SchedulingMetadataSkipsPendingMemfile(t *testing.T) {
 	require.NotNil(t, md)
 	assert.Empty(t, md.GetMemfileBaseBuildId())
 	assert.Equal(t, rootfsBase.String(), md.GetRootfsBaseBuildId())
+}
+
+// footprintHeader builds a header whose mapping has exactly n entries, using a
+// distinct build id per entry so nothing merges.
+func footprintHeader(t *testing.T, n int) *header.Header {
+	t.Helper()
+
+	const blockSize = uint64(4096)
+
+	maps := make([]header.BuildMap, n)
+	for i := range maps {
+		maps[i] = header.BuildMap{
+			Offset:  uint64(i) * blockSize,
+			Length:  blockSize,
+			BuildId: uuid.New(),
+		}
+	}
+
+	h, err := header.NewHeader(&header.Metadata{
+		Version:     3,
+		BlockSize:   blockSize,
+		Size:        uint64(n) * blockSize,
+		BuildId:     uuid.New(),
+		BaseBuildId: uuid.New(),
+	}, maps)
+	require.NoError(t, err)
+	require.Equal(t, n, h.Mapping.Len())
+
+	return h
+}
+
+// The gauge exists to size a bound, so it has to see every mapping the template
+// keeps alive. After a pause the provisional header stays referenced by
+// memfileHeader while the device has already moved on to the deduped one, so a
+// gauge that reads only the devices reports one mapping where two are resident
+// — understating exactly the footprint it is used to size.
+func TestStorageTemplate_HeaderFootprintCountsRetainedHolders(t *testing.T) {
+	t.Parallel()
+
+	provisional := footprintHeader(t, 12)
+	deduped := footprintHeader(t, 3)
+	rootfsHdr := footprintHeader(t, 5)
+
+	memDev := blockmocks.NewMockReadonlyDevice(t)
+	memDev.EXPECT().Header().Return(deduped)
+	rootfsDev := blockmocks.NewMockReadonlyDevice(t)
+	rootfsDev.EXPECT().Header().Return(rootfsHdr)
+
+	tmpl := &storageTemplate{
+		memfile:              utils.NewSetOnce[block.ReadonlyDevice](),
+		rootfs:               utils.NewSetOnce[block.ReadonlyDevice](),
+		memfileHeader:        resolvedHeader(provisional),
+		rootfsHeader:         resolvedHeader(rootfsHdr),
+		durableMemfileHeader: resolvedHeader(deduped),
+	}
+	require.NoError(t, tmpl.memfile.SetValue(memDev))
+	require.NoError(t, tmpl.rootfs.SetValue(rootfsDev))
+
+	entries, bytes := tmpl.headerFootprint()
+
+	wantEntries := provisional.Mapping.Len() + deduped.Mapping.Len() + rootfsHdr.Mapping.Len()
+	wantBytes := provisional.Mapping.ByteSize() + deduped.Mapping.ByteSize() + rootfsHdr.Mapping.ByteSize()
+
+	assert.Equal(t, wantEntries, entries, "the provisional header is still resident and must be counted")
+	assert.Equal(t, wantBytes, bytes)
+}
+
+// The holders usually resolve to the same headers the devices carry. Counting
+// those twice would overstate the number the sizing decisions are made from.
+func TestStorageTemplate_HeaderFootprintCountsEachMappingOnce(t *testing.T) {
+	t.Parallel()
+
+	memHdr := footprintHeader(t, 7)
+	rootfsHdr := footprintHeader(t, 4)
+
+	memDev := blockmocks.NewMockReadonlyDevice(t)
+	memDev.EXPECT().Header().Return(memHdr)
+	rootfsDev := blockmocks.NewMockReadonlyDevice(t)
+	rootfsDev.EXPECT().Header().Return(rootfsHdr)
+
+	tmpl := &storageTemplate{
+		memfile:       utils.NewSetOnce[block.ReadonlyDevice](),
+		rootfs:        utils.NewSetOnce[block.ReadonlyDevice](),
+		memfileHeader: resolvedHeader(memHdr),
+		rootfsHeader:  resolvedHeader(rootfsHdr),
+	}
+	require.NoError(t, tmpl.memfile.SetValue(memDev))
+	require.NoError(t, tmpl.rootfs.SetValue(rootfsDev))
+
+	entries, bytes := tmpl.headerFootprint()
+
+	assert.Equal(t, memHdr.Mapping.Len()+rootfsHdr.Mapping.Len(), entries)
+	assert.Equal(t, memHdr.Mapping.ByteSize()+rootfsHdr.Mapping.ByteSize(), bytes)
+}
+
+// A template that is still fetching must contribute nothing rather than block
+// the metrics collection goroutine on its unresolved futures.
+func TestStorageTemplate_HeaderFootprintSkipsUnresolved(t *testing.T) {
+	t.Parallel()
+
+	tmpl := &storageTemplate{
+		memfile:       utils.NewSetOnce[block.ReadonlyDevice](),
+		rootfs:        utils.NewSetOnce[block.ReadonlyDevice](),
+		memfileHeader: utils.NewSetOnce[*header.Header](),
+		rootfsHeader:  utils.NewSetOnce[*header.Header](),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+
+		entries, bytes := tmpl.headerFootprint()
+		assert.Zero(t, entries)
+		assert.Zero(t, bytes)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("headerFootprint blocked on an unresolved template")
+	}
+}
+
+// One allocation reaches headerFootprint by two routes once a snapshot's upload
+// publishes: CloneForUpload copies the Header struct, so the clone shares the
+// source's Mapping slices, and publish installs the clone on the device while
+// the holder keeps the source. Header identity does not see that, so the gauge
+// would step up as uploads land — reading like retention growth rather than a
+// counting artifact, on exactly the population a byte budget gets sized from.
+func TestStorageTemplate_HeaderFootprintCountsSharedMappingOnce(t *testing.T) {
+	t.Parallel()
+
+	source := footprintHeader(t, 9)
+	published := source.CloneForUpload(source.Metadata.Version + 1)
+	require.NotSame(t, source, published, "the clone is a distinct header")
+	require.True(t, source.Mapping.SharesStorageWith(published.Mapping),
+		"the clone must share the source's mapping, or this test proves nothing")
+
+	rootfsHdr := footprintHeader(t, 4)
+
+	memDev := blockmocks.NewMockReadonlyDevice(t)
+	memDev.EXPECT().Header().Return(published)
+	rootfsDev := blockmocks.NewMockReadonlyDevice(t)
+	rootfsDev.EXPECT().Header().Return(rootfsHdr)
+
+	tmpl := &storageTemplate{
+		memfile:       utils.NewSetOnce[block.ReadonlyDevice](),
+		rootfs:        utils.NewSetOnce[block.ReadonlyDevice](),
+		memfileHeader: resolvedHeader(source),
+		rootfsHeader:  resolvedHeader(rootfsHdr),
+	}
+	require.NoError(t, tmpl.memfile.SetValue(memDev))
+	require.NoError(t, tmpl.rootfs.SetValue(rootfsDev))
+
+	entries, bytes := tmpl.headerFootprint()
+
+	assert.Equal(t, source.Mapping.Len()+rootfsHdr.Mapping.Len(), entries,
+		"the shared mapping must be counted once, not once per header")
+	assert.Equal(t, source.Mapping.ByteSize()+rootfsHdr.Mapping.ByteSize(), bytes)
 }

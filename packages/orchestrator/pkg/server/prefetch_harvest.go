@@ -108,7 +108,7 @@ type harvestInstance interface {
 
 // harvestTemplates is the subset of the template cache the harvest uses.
 type harvestTemplates interface {
-	GetTemplate(ctx context.Context, buildID string, isSnapshot, isBuilding bool, opts ...sbxtemplate.GetTemplateOpts) (sbxtemplate.Template, error)
+	GetTemplatePinned(ctx context.Context, buildID string, isSnapshot, isBuilding bool, opts ...sbxtemplate.GetTemplateOpts) (sbxtemplate.Template, func(), error)
 	UpdateMetadata(buildID string, meta metadata.Template) error
 }
 
@@ -394,11 +394,17 @@ func (h *prefetchHarvester) resumeMapping(
 	// pays no cold GCS/NFS fetch, only a local re-fault. isSnapshot=true mirrors
 	// Checkpoint's resume. The pause artifact carries no Prefetch (SameVersion
 	// dropped it), so no prefetcher runs and the trace is clean demand faults.
-	tmpl, err := h.templates.GetTemplate(ctx, buildID, true, false,
+	// Pinned: the throwaway below is a real Firecracker VM running off this
+	// template's snapfile, so for its lifetime the template must not be
+	// evictable — eviction Closes it, and Close removes the snapfile. Released
+	// last, after the reap deferred below has torn the throwaway down.
+	tmpl, releaseTemplate, err := h.templates.GetTemplatePinned(ctx, buildID, true, false,
 		sbxtemplate.GetTemplateOpts{MaxSandboxLengthHours: sbx.Config.MaxSandboxLengthHours})
 	if err != nil {
 		return nil, harvestResumeFailed, fmt.Errorf("get template: %w", err)
 	}
+
+	defer releaseTemplate()
 
 	// Throwaway identity: distinct SandboxID/ExecutionID from the (being-stopped)
 	// original so it never collides in the sandbox map. ResumeSandbox registers

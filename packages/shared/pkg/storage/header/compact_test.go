@@ -135,3 +135,118 @@ func TestMapping_Validate(t *testing.T) {
 	require.NoError(t, err)
 	require.Error(t, gap.Validate(3*bs, bs))
 }
+
+// ByteSize is what the orchestrator's residency gauges are built on, and the
+// whole reason for the compact encoding is that these mappings dominate host
+// RAM. A sign error or an off-by-one here would silently misreport the number
+// the sizing decisions are made from, so pin the arithmetic against explicitly
+// counted entries and builds.
+func TestMapping_ByteSize(t *testing.T) {
+	t.Parallel()
+
+	const bytesPerEntry = 14 // offsets + lengths + storage (4 each) + buildIdx (2)
+	const bytesPerBuild = 16 // uuid.UUID
+
+	bs := uint64(4096)
+	a := uuid.New()
+	b := uuid.New()
+
+	tests := []struct {
+		name    string
+		src     []BuildMap
+		entries int
+		builds  int
+	}{
+		{name: "empty"},
+		{
+			name:    "one entry one build",
+			src:     []BuildMap{{Offset: 0, Length: bs, BuildId: a}},
+			entries: 1,
+			builds:  1,
+		},
+		{
+			name: "builds are deduplicated, entries are not",
+			src: []BuildMap{
+				{Offset: 0, Length: bs, BuildId: a},
+				{Offset: bs, Length: bs, BuildId: b},
+				{Offset: 2 * bs, Length: bs, BuildId: a, BuildStorageOffset: bs},
+			},
+			entries: 3,
+			builds:  2,
+		},
+		{
+			// An empty region carries no build, so it costs an entry and nothing
+			// in the build table.
+			name: "nil build ids cost no build table slot",
+			src: []BuildMap{
+				{Offset: 0, Length: bs, BuildId: uuid.Nil},
+				{Offset: bs, Length: bs, BuildId: uuid.Nil},
+			},
+			entries: 2,
+			builds:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			m, err := NewMapping(bs, tt.src)
+			require.NoError(t, err)
+
+			require.Equal(t, tt.entries, m.Len())
+			require.Len(t, m.Builds(), tt.builds)
+			require.Equal(t, tt.entries*bytesPerEntry+tt.builds*bytesPerBuild, m.ByteSize())
+		})
+	}
+}
+
+// The encoding's claim is 14 bytes per entry against a BuildMap's 40, so the
+// gauge must scale with entry count and stay far under the uncompacted size.
+func TestMapping_ByteSizeScalesWithEntries(t *testing.T) {
+	t.Parallel()
+
+	bs := uint64(4096)
+	id := uuid.New()
+
+	src := make([]BuildMap, 1000)
+	for i := range src {
+		src[i] = BuildMap{Offset: uint64(i) * bs, Length: bs, BuildId: id}
+	}
+
+	m, err := NewMapping(bs, src)
+	require.NoError(t, err)
+
+	require.Equal(t, 1000*14+16, m.ByteSize())
+	require.Less(t, m.ByteSize(), len(src)*40, "compact mapping must be smaller than the BuildMap slice it replaces")
+}
+
+// The footprint gauges rely on this to tell one allocation reached through two
+// Headers from two allocations. CloneForUpload copies the Header struct, so the
+// copy's Mapping shares the original's slices.
+func TestMapping_SharesStorageWith(t *testing.T) {
+	t.Parallel()
+
+	bs := uint64(4096)
+	id := uuid.New()
+	src := []BuildMap{
+		{Offset: 0, Length: bs, BuildId: id},
+		{Offset: bs, Length: bs, BuildId: id, BuildStorageOffset: bs},
+	}
+
+	m, err := NewMapping(bs, src)
+	require.NoError(t, err)
+
+	shared := m
+	require.True(t, m.SharesStorageWith(shared), "a copy shares the original's columns")
+	require.True(t, shared.SharesStorageWith(m), "and the relation is symmetric")
+
+	other, err := NewMapping(bs, src)
+	require.NoError(t, err)
+	require.False(t, m.SharesStorageWith(other), "separately built mappings are separate allocations")
+
+	empty, err := NewMapping(bs, nil)
+	require.NoError(t, err)
+	require.False(t, empty.SharesStorageWith(empty), "an empty mapping holds no allocation to share")
+	require.False(t, m.SharesStorageWith(empty))
+}

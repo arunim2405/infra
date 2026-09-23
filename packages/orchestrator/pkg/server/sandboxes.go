@@ -244,7 +244,14 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	}
 	defer s.startingSandboxes.Release(1)
 
-	template, err := s.templateCache.GetTemplate(
+	// Pinned: eviction Closes a template, which deletes its snapfile/metafile
+	// from disk, so a template backing a running sandbox must not be evictable.
+	// The pin is taken atomically with the lookup — taking it afterwards can
+	// race an eviction already in flight. Released either by the rollback below
+	// (if we never reach the lifecycle goroutine) or by that goroutine once the
+	// sandbox has closed; releaseTemplate is idempotent, so registering it on
+	// both paths still releases exactly one pin.
+	template, releaseTemplate, err := s.templateCache.GetTemplatePinned(
 		ctx,
 		req.GetSandbox().GetBuildId(),
 		req.GetSandbox().GetSnapshot(),
@@ -254,6 +261,13 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	if err != nil {
 		return nil, fmt.Errorf("failed to get template snapshot data: %w", err)
 	}
+
+	rollback = sandbox.NewCleanup()
+	rollback.AddNoContext(ctx, func() error {
+		releaseTemplate()
+
+		return nil
+	})
 
 	// Clone the network config to avoid modifying the original request
 	network := proto.CloneOf(req.GetSandbox().GetNetwork())
@@ -362,9 +376,8 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		return nil, status.Errorf(codes.Internal, "failed to create sandbox: %s", err)
 	}
 
-	rollback = sandbox.NewCleanup()
 	rollback.Add(ctx, func(ctx context.Context) error { return stopAndCloseSandbox(ctx, sbx) })
-	s.setupSandboxLifecycle(ctx, sbx)
+	s.setupSandboxLifecycle(ctx, sbx, releaseTemplate)
 
 	// Resume-time envd live-upgrade. The API /resume maps to Create
 	// with snapshot=true, so this is the real resume path. Flag-driven,
@@ -1314,13 +1327,20 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 	}
 
 	// Get the template for resume
-	template, err := s.templateCache.GetTemplate(ctx, in.GetBuildId(), true, false,
+	// Pinned for the resumed sandbox's lifetime; see the Create path for why.
+	template, releaseTemplate, err := s.templateCache.GetTemplatePinned(ctx, in.GetBuildId(), true, false,
 		sbxtemplate.GetTemplateOpts{MaxSandboxLengthHours: sbx.Config.MaxSandboxLengthHours})
 	if err != nil {
 		telemetry.ReportCriticalError(ctx, "error getting template for resume after checkpoint", err, telemetry.WithSandboxID(in.GetSandboxId()))
 
 		return nil, status.Errorf(codes.Internal, "error getting template for resume: %s", err)
 	}
+
+	rollback.AddNoContext(ctx, func() error {
+		releaseTemplate()
+
+		return nil
+	})
 
 	// Resume the sandbox keeping the same ExecutionID (stable identity for
 	// the API, routing catalog, and analytics) but with a fresh LifecycleID
@@ -1359,7 +1379,7 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 	}
 
 	// Setup lifecycle for the resumed sandbox
-	s.setupSandboxLifecycle(ctx, resumedSbx)
+	s.setupSandboxLifecycle(ctx, resumedSbx, releaseTemplate)
 
 	// resume-time envd live-upgrade. Best-effort and tightly gated so
 	// it can never disrupt the universal resume path — except an unrecoverable
@@ -1684,12 +1704,23 @@ func (s *Server) sandboxAlreadyRunning(ctx context.Context, sandboxID, execution
 	return status.Errorf(codes.AlreadyExists, "sandbox '%s' is already running on this node: %s", sandboxID, cause)
 }
 
-// setupSandboxLifecycle sets up the cleanup goroutine for a sandbox.
-func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox) {
+// setupSandboxLifecycle starts the goroutine that waits for the sandbox to end
+// and tears it down. releaseTemplate lifts this sandbox's pin on its template;
+// it runs after the sandbox is closed, on every ending (kill, pause, checkpoint
+// hand-off, crash), and is idempotent so the caller's error rollback may also
+// hold a reference to it.
+func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox, releaseTemplate func()) {
 	s.sandboxFactory.Sandboxes.TrackLifecycle(ctx, sbx)
 	releaseWork := s.info.TrackWork()
 	go func() {
 		defer releaseWork()
+
+		// Deferred so it runs only after the body below has closed the sandbox:
+		// the template must not become evictable while the sandbox is still
+		// using it, since eviction deletes the snapfile.
+		if releaseTemplate != nil {
+			defer releaseTemplate()
+		}
 
 		ctx, childSpan := tracer.Start(context.WithoutCancel(ctx), "stop sandbox-lifecycle", trace.WithNewRoot())
 		defer childSpan.End()
