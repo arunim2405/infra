@@ -1176,3 +1176,43 @@ func TestFillMissingBuildsAsSentinels_NilBuilds(t *testing.T) {
 	require.NotNil(t, h.Builds)
 	require.Equal(t, BuildData{}, h.Builds[selfID])
 }
+
+// TestDeserialize_LegacyGapKeepsExplicitLengths reads V3 and V4 headers whose
+// mappings leave a gap, as headers predating NormalizeFixVersion may. The
+// record-per-entry formats round-trip them unchanged, so the compact form must
+// fall back to an explicit lengths column rather than derive them.
+func TestDeserialize_LegacyGapKeepsExplicitLengths(t *testing.T) {
+	t.Parallel()
+
+	bs := uint64(4096)
+	a, b := uuid.New(), uuid.New()
+	mappings := []BuildMap{
+		{Offset: 0, Length: bs, BuildId: a, BuildStorageOffset: 0},
+		{Offset: 2 * bs, Length: bs, BuildId: b, BuildStorageOffset: 0},
+		{Offset: 3 * bs, Length: bs, BuildId: a, BuildStorageOffset: bs},
+	}
+
+	versions := map[string]uint64{"v2": 2, "v4": MetadataVersionV4}
+	for name, version := range versions {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			meta := &Metadata{Version: version, BlockSize: bs, Size: 4 * bs, BuildId: a, BaseBuildId: b}
+			h, err := NewHeader(meta, mappings)
+			require.NoError(t, err)
+			require.False(t, h.Mapping.Contiguous())
+			if version >= MetadataVersionV4 {
+				h.Builds = map[uuid.UUID]BuildData{a: {Size: int64(2 * bs)}, b: {Size: int64(bs)}}
+			}
+
+			data, err := SerializeHeader(h)
+			require.NoError(t, err)
+			got, err := DeserializeBytes(data)
+			require.NoError(t, err)
+
+			require.False(t, got.Mapping.Contiguous())
+			require.Equal(t, mappings, got.Mapping.Slice())
+			require.Error(t, got.Mapping.Validate(4*bs, PageSize))
+		})
+	}
+}
