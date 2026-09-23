@@ -75,6 +75,7 @@ components:
       name: teamID
       in: path
       required: true
+      description: Identifier of the team, as its UUID or its public project ID (prj_)
       schema:
         type: string
     nodeID:
@@ -1521,7 +1522,7 @@ components:
         teamID:
           deprecated: true
           type: string
-          description: Identifier of the team
+          description: Identifier of the team, as its UUID or its public project ID (prj_)
         cpuCount:
           $ref: "#/components/schemas/CPUCount"
         memoryMB:
@@ -3759,7 +3760,7 @@ paths:
           name: teamID
           schema:
             type: string
-            description: Identifier of the team
+            description: Identifier of the team, as its UUID or its public project ID (prj_)
         - $ref: "#/components/parameters/paginationNextToken"
         - $ref: "#/components/parameters/paginationLimit"
       responses:
@@ -3846,7 +3847,7 @@ paths:
           name: teamID
           schema:
             type: string
-            description: Identifier of the team
+            description: Identifier of the team, as its UUID or its public project ID (prj_)
       responses:
         "200":
           description: Successfully returned all templates

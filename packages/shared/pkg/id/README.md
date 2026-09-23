@@ -40,6 +40,12 @@ Project and workspace UUIDs are normally UUIDv4 and use `typeid.Random`.
 Secret UUIDs are UUIDv7 and use `typeid.Sortable`. SumUp renders Random IDs in
 uppercase, so the E2B wrapper normalizes them to the lowercase public contract.
 
+## Team IDs
+
+Teams are projects: a team UUID is also its project UUID.
+`ConvertTeamIDToProjectID` renders a team UUID as its public `prj_` ID, and
+`ParseTeamID` accepts either spelling wherever an API takes a team ID.
+
 ## Adding a resource ID
 
 To add another public resource ID:

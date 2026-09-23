@@ -1537,7 +1537,7 @@ type TemplateBuildRequestV3 struct {
 	// Tags Tags to assign to the template build
 	Tags *[]string `json:"tags,omitempty"`
 
-	// TeamID Identifier of the team
+	// TeamID Identifier of the team, as its UUID or its public project ID (prj_)
 	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	TeamID *string `json:"teamID,omitempty"`
 }

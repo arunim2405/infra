@@ -17,6 +17,7 @@ import (
 	"github.com/e2b-dev/infra/packages/auth/pkg/types"
 	authdb "github.com/e2b-dev/infra/packages/db/pkg/auth"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
+	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
@@ -194,10 +195,22 @@ func (s *AuthService) ValidateAuthProviderTeam(ctx context.Context, ginCtx *gin.
 		}
 	}
 
-	cacheKey := teamMemberCacheKey(userID, teamID)
+	// The header may carry the public project ID; key the cache on the UUID so
+	// membership invalidation, which is keyed by UUID, evicts every spelling.
+	parsedTeamID, err := id.ParseTeamID(teamID)
+	if err != nil {
+		return nil, &APIError{
+			Err:       fmt.Errorf("failed parsing team ID: %w", err),
+			ClientMsg: "Backend authentication failed",
+			Code:      http.StatusUnauthorized,
+		}
+	}
+	canonicalTeamID := parsedTeamID.String()
+
+	cacheKey := teamMemberCacheKey(userID, canonicalTeamID)
 
 	result, err := s.teamCache.GetOrSet(ctx, cacheKey, func(ctx context.Context, _ string) (*types.Team, error) {
-		return s.store.GetTeamByIDAndUserID(ctx, userID, teamID)
+		return s.store.GetTeamByIDAndUserID(ctx, userID, canonicalTeamID)
 	})
 	if err != nil {
 		if _, ok := errors.AsType[*internalauthteam.ForbiddenError](err); ok {
