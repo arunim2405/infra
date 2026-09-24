@@ -140,6 +140,8 @@ compose_config_json_clean() {
   cmp "$BATS_TEST_TMPDIR/clickhouse" kubernetes/config/clickhouse-config.xml
   python3 compose/scripts/dev/sync-configs.py --print-k8s compose/config/vector/vector.toml > "$BATS_TEST_TMPDIR/vector"
   cmp "$BATS_TEST_TMPDIR/vector" kubernetes/config/vector.toml
+  python3 compose/scripts/dev/sync-configs.py --print-k8s compose/config/otel/otel-collector.yaml > "$BATS_TEST_TMPDIR/otel"
+  cmp "$BATS_TEST_TMPDIR/otel" kubernetes/config/otel-collector.yaml
 }
 
 @test "every store binds loopback on the host network" {
@@ -435,7 +437,9 @@ def value_of(chunk):
             ref[m.group(1)] = m.group(2)
     body = "\n".join(chunk)
     if "configMapKeyRef" in body:
-        return maps.get(ref.get("name"), {}).get(ref.get("key"), "<configmap?>")
+        # kustomize quotes a map value only where YAML needs it, as it does
+        # the empty collector endpoint.
+        return unquote(maps.get(ref.get("name"), {}).get(ref.get("key"), "<configmap?>"))
     if "secretKeyRef" in body:
         return "<secret:%s/%s>" % (ref.get("name"), ref.get("key"))
     if "fieldRef" in body:
@@ -498,6 +502,15 @@ for name in ("api", "orchestrator", "client-proxy", "postgres", "clickhouse",
     if name not in containers:
         problems.append("no %s container was parsed out of the manifest" % name)
 
+# The collector endpoint is empty by default on both shapes, so the comparison
+# above would also pass with the variable missing from both. Every service
+# that exports telemetry has to carry it, on each side.
+for name in ("api", "orchestrator", "client-proxy", "dashboard-api"):
+    if "OTEL_COLLECTOR_GRPC_ENDPOINT" not in containers.get(name, {}):
+        problems.append("the manifest's %s has no OTEL_COLLECTOR_GRPC_ENDPOINT" % name)
+    if "OTEL_COLLECTOR_GRPC_ENDPOINT" not in (compose.get(name, {}).get("environment") or {}):
+        problems.append("compose's %s has no OTEL_COLLECTOR_GRPC_ENDPOINT" % name)
+
 if problems:
     sys.exit("\n".join(problems))
 PY
@@ -522,4 +535,99 @@ PY
     echo "the init containers now end (-) where they must end (+)"
     return 1
   }
+}
+
+# The patch line kustomization.yaml ships commented, turned on in a scratch
+# copy of the directory so the checked-in file stays as it is.
+PATCH_LINE='patches: [{ path: patches/otel-collector.yaml, target: { kind: StatefulSet, name: e2b } }]'
+
+render_with_collector() {
+  local dir="$BATS_TEST_TMPDIR/kubernetes"
+  cp -R kubernetes "$dir"
+  awk -v line="$PATCH_LINE" '$0 == "# " line { $0 = line } { print }' \
+    kubernetes/kustomization.yaml > "$dir/kustomization.yaml"
+  grep -qxF "$PATCH_LINE" "$dir/kustomization.yaml" || {
+    echo "kustomization.yaml has no '# $PATCH_LINE' line to uncomment" >&2
+    return 1
+  }
+  kubectl kustomize "$dir"
+}
+
+# The built-in collector is opt-in: without the patch there is no container
+# for it, but its ConfigMap is generated either way, so turning it on is the
+# one commented line.
+@test "the collector's ConfigMap is generated and its container is not" {
+  grep -qxF "# $PATCH_LINE" kubernetes/kustomization.yaml
+  run grep -n '^        name: otel-collector$' <<<"$RENDERED"
+  [ "$status" -eq 1 ]
+  printf '%s\n' "$RENDERED" | grep -q '^  name: otel-config-[a-z0-9]*$'
+}
+
+# With the patch the collector is one more native sidecar, after the dashboard
+# pair, on the image compose pins, reading the generated ConfigMap at the path
+# its --config names, and probed over HTTP since the image has no shell.
+@test "the patch line adds the collector as the last sidecar with its config mounted" {
+  render_with_collector > "$BATS_TEST_TMPDIR/patched.yaml"
+  image="$(docker compose --project-directory compose --profile otel config --format json |
+    jq -r '.services["otel-collector"].image')"
+  [ -n "$image" ] && [ "$image" != null ]
+  run python3 - "$BATS_TEST_TMPDIR/patched.yaml" "$image" <<'PY'
+import re, sys
+
+lines = open(sys.argv[1]).read().splitlines()
+image = sys.argv[2]
+problems = []
+
+
+def blocks_under(key):
+    """The list items under the pod spec's six-space `key:`."""
+    start = lines.index("      %s:" % key)
+    out, cur = [], None
+    for line in lines[start + 1:]:
+        if line.startswith("      - "):
+            cur = [line]
+            out.append(cur)
+        elif re.match(r"^ {0,7}\S", line):
+            break
+        elif cur is not None:
+            cur.append(line)
+    return out
+
+
+def name_of(block, indent):
+    for line in block:
+        m = re.match(r"^ {%d}name: (\S+)$" % indent, line)
+        if m:
+            return m.group(1)
+    return None
+
+
+inits = blocks_under("initContainers")
+names = [name_of(b, 8) for b in inits]
+if names[-3:] != ["dashboard-api", "dashboard", "otel-collector"]:
+    problems.append("the init containers end %r" % names[-3:])
+collector = inits[names.index("otel-collector")] if "otel-collector" in names else []
+text = "\n".join(collector)
+for want in ("        image: %s" % image,
+             "        restartPolicy: Always",
+             "        - --config=/etc/otelcol-contrib/config.yaml",
+             "        - mountPath: /etc/otelcol-contrib/config.yaml\n          name: otel-config\n          subPath: config.yaml",
+             "          httpGet:\n            host: 127.0.0.1\n            path: /\n            port: 13133"):
+    if want not in text:
+        problems.append("the collector container lacks %r" % want)
+
+volumes = {name_of(b, 8): "\n".join(b) for b in blocks_under("volumes")}
+m = re.search(r"^ {10}name: (otel-config-\S+)$", volumes.get("otel-config", ""), re.M)
+if not m:
+    problems.append("no otel-config volume naming the generated ConfigMap")
+elif "  name: %s" % m.group(1) not in lines:
+    problems.append("the otel-config volume names %s, which is not rendered" % m.group(1))
+
+if problems:
+    sys.exit("\n".join(problems))
+PY
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+
+  # Still one wildcard bind, the dashboard's: the collector adds none.
+  [ "$(grep -c '0\.0\.0\.0' "$BATS_TEST_TMPDIR/patched.yaml")" -eq 1 ]
 }

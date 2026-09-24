@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-.PHONY: lint config test images stores-check vector-validate sync-configs kubernetes-render terraform-validate
+.PHONY: lint config test images stores-check vector-validate otel-validate sync-configs kubernetes-render terraform-validate
 
 # Every compose invocation runs against compose/, where compose.yaml and .env
 # live; the other two install shapes have their own directories beside it.
@@ -14,7 +14,7 @@ BATS_FILES := $(strip $(wildcard tests/*.bats))
 config:
 	$(COMPOSE) config -q
 
-lint: config vector-validate kubernetes-render terraform-validate
+lint: config vector-validate otel-validate kubernetes-render terraform-validate
 	@if [ -n "$(strip $(SHELL_FILES))" ]; then shellcheck -x $(SHELL_FILES); fi
 	@if [ -n "$(strip $(BATS_FILES))" ]; then shellcheck -x -s bash $(BATS_FILES); fi
 
@@ -38,9 +38,20 @@ vector-validate:
 	docker run --rm -v "$(CURDIR)/compose/config/vector/vector.toml:/etc/vector/vector.toml:ro" \
 	  timberio/vector:0.51.1-alpine validate --no-environment /etc/vector/vector.toml
 
-# After editing compose/config/clickhouse/config.xml or
-# compose/config/vector/vector.toml: rewrite the inline copies in
-# compose/compose.yaml and their SHA-256 stamps.
+# The collector parses the config and builds every pipeline without starting
+# them, so a pipeline naming a component the config does not define fails
+# here rather than on a host. The image is the one compose.yaml pins, and the
+# Kubernetes copy of the config is this file as is.
+OTEL_IMAGE := $(shell sed -n 's/^    image: \(otel\/opentelemetry-collector-contrib:[^ ]*\)$$/\1/p' compose/compose.yaml)
+otel-validate:
+	@test -n "$(OTEL_IMAGE)" || { echo "otel-validate: compose/compose.yaml pins no otel/opentelemetry-collector-contrib image" >&2; exit 1; }
+	docker run --rm -v "$(CURDIR)/compose/config/otel/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro" \
+	  $(OTEL_IMAGE) validate --config=/etc/otelcol-contrib/config.yaml
+
+# After editing compose/config/clickhouse/config.xml,
+# compose/config/vector/vector.toml or compose/config/otel/otel-collector.yaml:
+# rewrite the inline copies in compose/compose.yaml, their SHA-256 stamps and
+# the Kubernetes copies under kubernetes/config/.
 sync-configs:
 	python3 compose/scripts/dev/sync-configs.py
 

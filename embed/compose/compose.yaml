@@ -5,10 +5,12 @@
 # variable. Without it Compose renders a blank image name or a blank kernel
 # version and only warns, and the operator meets either a confusing "neither
 # an image nor a build context" error or a fetch-artifacts failure after the
-# host has already been mutated. The eight knobs that are genuinely optional and
-# are absent from .env (TEAM_API_KEY, ADMIN_TOKEN, SANDBOX_ACCESS_TOKEN_HASH_SEED
-# and E2B_DASHBOARD_HOST only as commented lines) keep the ${VAR:-...} form: HUGEPAGES, NBDS_MAX, PF_MIN_FREE_GIB,
-# FORCE_REBUILD and E2B_DASHBOARD_HOST carry a working default, while
+# host has already been mutated. The nine knobs that are genuinely optional and
+# are absent from .env (TEAM_API_KEY, ADMIN_TOKEN, SANDBOX_ACCESS_TOKEN_HASH_SEED,
+# E2B_DASHBOARD_HOST and E2B_OTEL_COLLECTOR_GRPC_ENDPOINT only as commented
+# lines) keep the ${VAR:-...} form: HUGEPAGES, NBDS_MAX, PF_MIN_FREE_GIB,
+# FORCE_REBUILD, E2B_DASHBOARD_HOST and E2B_OTEL_COLLECTOR_GRPC_ENDPOINT carry a
+# working default (the last an empty one, which exports no telemetry), while
 # TEAM_API_KEY, ADMIN_TOKEN and SANDBOX_ACCESS_TOKEN_HASH_SEED carry none — the
 # stack generates all three per install (seed for the key, api-secrets for the
 # api's two), and a value set in .env or the shell overrides the generated one.
@@ -101,6 +103,30 @@ services:
       interval: 10s
       timeout: 2s
       retries: 12
+
+  # The built-in OpenTelemetry collector, run only with the otel profile:
+  # COMPOSE_PROFILES=otel in .env, which Compose reads itself. It receives
+  # OTLP/gRPC on 127.0.0.1:4317, the address to give
+  # E2B_OTEL_COLLECTOR_GRPC_ENDPOINT, and writes the e2b.* metrics into
+  # ClickHouse (config/otel/otel-collector.yaml says what it keeps). The image
+  # has no shell, so there is no healthcheck; `curl -s 127.0.0.1:13133` on the
+  # host is the check. No service depends on it, `ready` included.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.146.0
+    profiles: [otel]
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      clickhouse-migrator:
+        condition: service_completed_successfully
+    environment:
+      # sha256 of config/otel/otel-collector.yaml, same purpose as
+      # VECTOR_CONFIG_SHA256 on the vector service.
+      OTEL_CONFIG_SHA256: 96621f22e4e8ab2b420a6bc659c0b47239535f90627951aba449a309f614ce5f
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    configs:
+      - source: otel-collector-config
+        target: /etc/otelcol-contrib/config.yaml
 
   db-migrator:
     image: ${E2B_DB_MIGRATOR_IMAGE:?fetch the .env that ships beside compose.yaml (README, Install)}
@@ -240,6 +266,10 @@ services:
       REDIS_URL: 127.0.0.1:6379
       CLICKHOUSE_CONNECTION_STRING: clickhouse://clickhouse:clickhouse@127.0.0.1:9000/default
       LOGS_COLLECTOR_ADDRESS: http://127.0.0.1:30006
+      # Where this service and api, client-proxy and dashboard-api export their
+      # metrics, traces and logs over OTLP/gRPC. Empty unless .env sets
+      # E2B_OTEL_COLLECTOR_GRPC_ENDPOINT, and empty exports nothing.
+      OTEL_COLLECTOR_GRPC_ENDPOINT: ${E2B_OTEL_COLLECTOR_GRPC_ENDPOINT:-}
       TEMPLATE_STORAGE_URL: file:///var/lib/e2b/storage/templates
       BUILD_CACHE_STORAGE_URL: file:///var/lib/e2b/storage/build-cache
       ARTIFACTS_REGISTRY_PROVIDER: Local
@@ -304,6 +334,7 @@ services:
       # LOKI_URL, and tests/pins.bats refuses that pin.
       LOGS_READ_CONFIG: "true"
       LOGS_COLLECTOR_ADDRESS: http://127.0.0.1:30006
+      OTEL_COLLECTOR_GRPC_ENDPOINT: ${E2B_OTEL_COLLECTOR_GRPC_ENDPOINT:-}
       API_INTERNAL_GRPC_PORT: "5009"
       API_EDGE_GRPC_PORT: "5109"
       PPROF_PORT: "6060"
@@ -388,6 +419,7 @@ services:
       POSTGRES_CONNECTION_STRING: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
       REDIS_URL: 127.0.0.1:6379
       CLICKHOUSE_CONNECTION_STRING: clickhouse://clickhouse:clickhouse@127.0.0.1:9000/default
+      OTEL_COLLECTOR_GRPC_ENDPOINT: ${E2B_OTEL_COLLECTOR_GRPC_ENDPOINT:-}
       AUTH_PROVIDER_CONFIG: '{"jwt":[]}'
     volumes:
       - seed-state:/run/e2b:ro
@@ -472,6 +504,7 @@ services:
       API_INTERNAL_GRPC_ADDRESS: 127.0.0.1:5009
       PROXY_PORT: "3002"
       HEALTH_PORT: "3003"
+      OTEL_COLLECTOR_GRPC_ENDPOINT: ${E2B_OTEL_COLLECTOR_GRPC_ENDPOINT:-}
     depends_on:
       api:
         condition: service_healthy
@@ -853,3 +886,93 @@ configs:
       skip_unknown_fields = false
       compression = "gzip"
       batch.timeout_secs = 1
+  otel-collector-config:
+    content: |
+      # The built-in OpenTelemetry collector. The services export to it once their
+      # collector endpoint is 127.0.0.1:4317. It keeps the e2b.* metrics and writes
+      # them into the stack's own ClickHouse, into the metrics_gauge and metrics_sum
+      # tables the clickhouse-migrator creates; the api's metrics endpoints read
+      # what those two feed. Traces, logs and the other metrics are dropped; the
+      # commented otlp/upstream exporter below forwards traces and logs instead.
+      # Every listener binds loopback: the collector shares the machine's network
+      # with the services, and nothing off the machine has a reason to reach it.
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 127.0.0.1:4317
+              max_recv_msg_size_mib: 100
+
+      processors:
+        # Batches traces and logs on their way to nop, or to otlp/upstream once
+        # that forwards them.
+        batch:
+          timeout: 5s
+
+        batch/clickhouse:
+          timeout: 5s
+          send_batch_size: 50000
+
+        filter/external_metrics:
+          metrics:
+            include:
+              match_type: regexp
+              metric_names:
+                - "e2b.*"
+
+      extensions:
+        # `curl -s 127.0.0.1:13133` on the machine answers while the collector runs.
+        # The image has no shell, so there is nothing to check from inside it.
+        health_check:
+          endpoint: 127.0.0.1:13133
+
+      exporters:
+        clickhouse:
+          endpoint: tcp://127.0.0.1:9000
+          database: default
+          username: clickhouse
+          password: clickhouse
+          async_insert: true
+          create_schema: false
+          metrics_tables:
+            gauge:
+              name: metrics_gauge
+            sum:
+              name: metrics_sum
+
+        # Accepts traces and logs and discards them. Without a pipeline for them the
+        # receiver would answer Unimplemented, and every service would log each
+        # batch it refused.
+        nop:
+
+        # To forward traces and logs to a collector of your own, uncomment this
+        # exporter, put that collector's OTLP/gRPC address in its endpoint, and
+        # name it in place of nop in the traces and logs pipelines at the end.
+        # otlp/upstream:
+        #   endpoint: collector.example.com:4317
+        #   tls:
+        #     insecure: true
+
+      service:
+        telemetry:
+          logs:
+            level: warn
+          # No internal metrics: by default the collector serves its own on
+          # 127.0.0.1:8888, one more listener on the machine, and refuses to start
+          # when something else holds that port.
+          metrics:
+            level: none
+        extensions: [health_check]
+        pipelines:
+          metrics/external:
+            receivers: [otlp]
+            processors: [filter/external_metrics, batch/clickhouse]
+            exporters: [clickhouse]
+          traces:
+            receivers: [otlp]
+            processors: [batch]
+            exporters: [nop]
+          logs:
+            receivers: [otlp]
+            processors: [batch]
+            exporters: [nop]

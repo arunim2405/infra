@@ -179,7 +179,8 @@ refill loop spins and logs `no free slots` every few seconds on an idle host.
 `FORCE_REBUILD=1`, settable in the
 same two places, forces `base-template` to rebuild even when a `base` row
 already shows `ready`, for a stale or broken template. `TEAM_API_KEY`,
-`ADMIN_TOKEN` and `SANDBOX_ACCESS_TOKEN_HASH_SEED` are under Secrets below.
+`ADMIN_TOKEN` and `SANDBOX_ACCESS_TOKEN_HASH_SEED` are under Secrets below,
+and `E2B_OTEL_COLLECTOR_GRPC_ENDPOINT` under Telemetry.
 
 An optional, git-ignored `env/api.local.env` can add api variables. Create
 the `env/` directory next to `compose.yaml` yourself, since the two-file
@@ -329,14 +330,44 @@ for the api process only. Read them from the volume instead:
 `docker compose run --rm --no-deps --entrypoint cat
 api-secrets /run/e2b/api.env`.
 
+### Telemetry
+
+Nothing is exported by default, so the dashboard's monitoring charts and the
+SDK's `getMetrics` (`get_metrics` in Python) stay empty. To run the built-in
+OpenTelemetry collector, which keeps those metrics in this stack's
+ClickHouse, uncomment the two lines that ship commented at the end of the
+optional block in `.env`:
+
+```bash
+E2B_OTEL_COLLECTOR_GRPC_ENDPOINT=127.0.0.1:4317
+COMPOSE_PROFILES=otel
+```
+
+Then run `docker compose up -d --wait`, which starts `otel-collector` and
+recreates the four services that export to it; recreating the orchestrator
+ends the sandboxes running on it. While the collector runs,
+`curl -s 127.0.0.1:13133` answers `Server available`, and once a sandbox has
+been running for a few seconds its rows show up:
+`docker compose exec clickhouse clickhouse-client --user clickhouse --password clickhouse --query "SELECT count() FROM sandbox_metrics_gauge"`.
+
+For a collector of your own, uncomment only the first line and put that
+collector's address in it. To turn the built-in one off again, comment both
+lines out, run `docker compose rm -sf otel-collector` and then
+`docker compose up -d --wait`. The reference's
+[Observability](../docs/REFERENCE.md#observability) says what each choice
+gives you and how to forward traces and logs as well.
+
 ### Upgrading
 
 Download `compose.yaml` and `.env` again, with the same command as
-[Install](#install), and run `docker compose up -d --wait --pull always`. The
-`.env` you get pins the stack images that go with those files, so the two
-always move together. To take a particular commit rather than the newest, put
-the commit in place of `main` in the two URLs, as in
-`raw.githubusercontent.com/e2b-dev/runtime/<commit>/embed/compose/…`; the raw
+[Install](#install), and run `docker compose up -d --wait --pull always`.
+Before that `up`, carry the optional lines you had set, such as
+`E2B_DASHBOARD_HOST` or the two under [Telemetry](#telemetry), over into the
+new `.env`: it ships them commented again, and without the Telemetry pair the
+services stop exporting. The `.env` you get pins the stack images that go with
+those files, so the two always move together. To take a particular commit
+rather than the newest, put the commit in place of `main` in the two URLs, as
+in `raw.githubusercontent.com/e2b-dev/runtime/<commit>/embed/compose/…`; the raw
 host ignores `?ref=`. Binary checksums live inside the tools
 image, so bumping a Firecracker artifact means taking newer files rather than
 editing anything on the host. Running sandboxes end when the orchestrator
@@ -356,7 +387,9 @@ restarts; a single machine has nowhere to drain them to.
 - Expected log noise, all harmless: an OIDC warning from api at startup,
   because no identity provider is configured, and, every ten seconds from both
   api and the orchestrator, `failed to upload metrics: exporter export
-  timeout`, because no OTEL collector is configured and the endpoint is empty.
+  timeout`, because no OpenTelemetry collector is configured and the endpoint
+  is empty. That line stops once `E2B_OTEL_COLLECTOR_GRPC_ENDPOINT` names a
+  collector that answers ([Telemetry](#telemetry)).
   dashboard-api also logs `ADMIN_AUTH_PROVIDER_CONFIG is not configured` once
   at startup; the management endpoints it guards are not used here.
 - To run without the dashboard, remove the `dashboard` and `dashboard-api`

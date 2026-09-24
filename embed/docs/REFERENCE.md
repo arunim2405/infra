@@ -1,15 +1,16 @@
 # E2B Embed reference
 
 The [hub README](../README.md) says what E2B Embed is and how to pick a
-shape. This page holds the rest: what runs where, the secrets, how images and
-pins are released, building templates, and the developer tooling. The 3
-guides cover what differs per shape.
+shape. This page holds the rest: what runs where, logs and telemetry, the
+secrets, how images and pins are released, building templates, and the
+developer tooling. The 3 guides cover what differs per shape.
 
 ## What runs where
 
 The 4 stores run in containers on a bridge network with their ports on
 `127.0.0.1`. api, client-proxy, dashboard-api, the dashboard and the released
-orchestrator run on the machine's own network. The orchestrator is a host
+orchestrator run on the machine's own network, and so does the opt-in
+collector ([Observability](#observability)). The orchestrator is a host
 process, launched through `nsenter` by a privileged container, the same
 pattern E2B's own Kubernetes deployment uses. Its launcher ends every sandbox
 when it stops.
@@ -43,9 +44,10 @@ also listens on 9004, 9005 and 9009, its MySQL and PostgreSQL wire protocols
 and its interserver port, since the pod shares the node's network. Vector's
 log listener is on 30006 (20006 on Kubernetes, for the reason that guide
 gives) and its API on 44313, on Kubernetes only. The 2 pprof endpoints are
-6060 for api and 6061 for the orchestrator. `sudo ss -ltnp` on the machine
-confirms the split: the 13 ports in the hub's table show a `*:` address,
-everything here shows `127.0.0.1:`.
+6060 for api and 6061 for the orchestrator. The built-in collector, when it
+runs, listens on 4317 and 13133 ([Observability](#observability)).
+`sudo ss -ltnp` on the machine confirms the split: the 13 ports in the hub's
+table show a `*:` address, everything here shows `127.0.0.1:`.
 
 Port 5008 creates and kills sandboxes and starts template builds. Nothing
 authenticates it; the api dials it directly as `LOCAL_ORCHESTRATOR_ADDRESS`,
@@ -54,16 +56,101 @@ ports (5010 and 5016 to 5018) take the sandbox traffic the orchestrator
 redirects inside each sandbox's network namespace. They expect no client from
 outside the machine and have no authentication of their own.
 
+## Observability
+
+What the stack keeps about itself, out of the box and with 1 setting.
+
 ### Logs
 
 Sandbox and template-build logs live in ClickHouse. The orchestrator and the
 api ship their lines to Vector: envd's output from inside the VM, the
 orchestrator's per-sandbox events, the template-manager's build output and
 the api's own. Vector turns each into a row of the `sandbox_logs` table. The
-api reads that table for the SDK's `getLogs` and `e2b template build`.
-`LOGS_READ_CONFIG=true` sets the api's `logs-read-config` flag, since there
-is no LaunchDarkly here to set it. Retention is the table's 7 days. There is
-no Loki in this stack, and the api needs no `LOKI_URL`.
+api reads that table for the SDK's `getLogs` and `e2b template build`, and
+the dashboard shows the same logs through it. `LOGS_READ_CONFIG=true` sets
+the api's `logs-read-config` flag, since there is no LaunchDarkly here to set
+it. Retention is the table's 7 days. There is no Loki in this stack, and the
+api needs no `LOKI_URL`.
+
+Every service also writes its own log to stdout, which is what
+`docker compose logs <service>` and `kubectl -n e2b logs e2b-0 -c <container>`
+print. None of this needs a collector.
+
+### The collector setting
+
+api, the orchestrator, client-proxy and dashboard-api carry the platform's
+OpenTelemetry instrumentation, and 1 setting points it at a collector:
+`E2B_OTEL_COLLECTOR_GRPC_ENDPOINT` in [`compose/.env`](../compose/.env), a
+`host:port` the 4 services reach over OTLP/gRPC without TLS. It ships
+commented, and empty or absent it exports nothing, which is how the stack runs
+by default. Set, each of the 4 sends its metrics every 15 seconds, its traces
+and its logs there. api and the orchestrator also export the `e2b.*` product
+metrics on their own: a team's running and created sandboxes, and each
+sandbox's CPU, memory and disk. With no endpoint those exporters time out and
+log `failed to upload metrics: exporter export timeout`; that line stops once
+the endpoint names a collector that answers.
+
+### The built-in collector
+
+`COMPOSE_PROFILES=otel`, the line under the endpoint in `.env` and also
+shipped commented, starts `otel-collector`: the OpenTelemetry Collector contrib
+image, on the machine's network, pinned inline in
+[`compose/compose.yaml`](../compose/compose.yaml) like the stores. It receives
+on `127.0.0.1:4317`, so the endpoint that goes with it is that address, and
+uncommenting both lines is the whole switch. Its config is
+[`compose/config/otel/otel-collector.yaml`](../compose/config/otel/otel-collector.yaml),
+inlined into the compose file as `otel-collector-config`.
+
+It keeps the `e2b.*` metrics and writes them into the stack's own ClickHouse,
+into `metrics_gauge` and `metrics_sum`. The `clickhouse-migrator` creates
+both, as routing tables that store nothing themselves: their materialized
+views fill `sandbox_metrics_gauge` (kept 7 days) and `team_metrics_gauge` and
+`team_metrics_sum` (kept 90), so those 3 are the ones to query. It drops
+every other metric, accepts traces and logs and discards them, and its health
+check answers `curl -s 127.0.0.1:13133` on the machine. The image has no
+shell, so Compose runs it without a healthcheck, and no service depends on
+it, `ready` included, so the rest of the stack starts whether it runs or not.
+
+It is not an observability stack. Nothing here stores or shows traces, logs
+or the services' own metrics. To keep traces and logs, forward them: the
+config sends them to a `nop` exporter and carries a commented `otlp/upstream`
+one. In your copy of `compose.yaml`, uncomment `otlp/upstream`, set its
+endpoint, name it in place of `nop` in the traces and logs pipelines, and run
+`docker compose up -d --force-recreate otel-collector`, since Compose does not
+recreate a container for a changed inline config on its own. On Kubernetes,
+make the same edit in `kubernetes/config/otel-collector.yaml`, or in an
+overlay's copy for the URL install (the
+[Kubernetes guide](../kubernetes/README.md#telemetry) has the overlay), and
+run `kubectl apply -k` again. The services' own metrics stop at the filter.
+To keep those too, send everything to a collector of your own instead: leave
+the profile off and put that collector's address in the endpoint. It then
+gets the `e2b.*` metrics as well, and this ClickHouse none.
+
+### What reads the metrics
+
+The api serves the 3 tables above: `GET /teams/{teamID}/metrics` and
+`/teams/{teamID}/metrics/max` for a team's concurrent sandboxes and start
+rate, and `GET /sandboxes/metrics` and `/sandboxes/{sandboxID}/metrics` for a
+sandbox's CPU, memory and disk, which the SDK's `getMetrics` (`get_metrics` in
+Python) reads. The dashboard's monitoring charts, a team's concurrent
+sandboxes and start rate and a sandbox's resource usage, are drawn from the
+same endpoints, so they stay empty until the built-in collector runs, or a
+collector of your own writes those metrics into this ClickHouse. Sandbox and
+build logs do not depend on it: they reach ClickHouse through Vector.
+
+### Ports and the other shapes
+
+4317 and 13133 bind `127.0.0.1` only, so they are not among the 13 ports in
+the hub's table, and no firewall needs to change for them.
+
+Kubernetes carries the same setting as the `OTEL_COLLECTOR_GRPC_ENDPOINT`
+literal of the `e2b-settings` ConfigMap, and the built-in collector as one
+commented patch line in the kustomization; the
+[Kubernetes guide](../kubernetes/README.md#telemetry) has both, and where the
+collector sits in the pod. Terraform has the `otel_collector_grpc_endpoint` and
+`otel_collector` variables, which the startup script writes into the
+instance's `.env`; the [Terraform guide](../terraform/gcp/README.md#variables)
+lists them.
 
 ## Secrets
 
@@ -103,11 +190,13 @@ reaches 3002.
 version the stack uses: the 5 released E2B service images (api, db-migrator,
 dashboard-api, client-proxy, clickhouse-migrator), the dashboard image, the 3
 stack images Embed builds itself, and the 5 Firecracker binaries. The 4 store
-images are pinned inline in [`compose/compose.yaml`](../compose/compose.yaml)
-and repeated in the StatefulSet. The stack images carry everything that is not
-a released E2B service: the host scripts, the SDK scripts and the database
-seeder. Terraform ships the `.env` to the instance, and Kubernetes repeats its
-pins in [`kubernetes/kustomization.yaml`](../kubernetes/kustomization.yaml).
+images and the built-in collector's are pinned inline in
+[`compose/compose.yaml`](../compose/compose.yaml) and repeated in the
+StatefulSet and its collector patch. The stack images carry everything that
+is not a released E2B service: the host scripts, the SDK scripts and the
+database seeder. Terraform ships the `.env` to the instance, and Kubernetes
+repeats its pins in
+[`kubernetes/kustomization.yaml`](../kubernetes/kustomization.yaml).
 The 3 stack images live in the `embed` repository of the `e2b-artifacts`
 registry.
 
@@ -125,7 +214,7 @@ the binary it publishes, and `fetch-artifacts` verifies against it. The
 dashboard image is released from its own repository
 (github.com/e2b-dev/dashboard, tags `vX.Y.Z`) and is pinned by hand too; its
 line carries no release marker. All of it is public and pulled anonymously;
-the stores come from Docker Hub.
+the stores and the collector come from Docker Hub.
 
 The 9 pinned images are published for both architectures; `fetch-artifacts`
 verifies the arm64 orchestrator and envd against the `.sha256` their release
@@ -142,11 +231,13 @@ URLs the guides use give the newest.
 Top to bottom: the source files, the Dockerfiles that copy them, the images
 (3 built here, 10 pulled ready-made) and the compose services. Arrows in the
 last band are `depends_on` gates, in start order. The stripe on each service
-says which image it runs. 2 things the picture leaves out: the ClickHouse and
-Vector configs are inlined into [`compose/compose.yaml`](../compose/compose.yaml)
-rather than shipped in an image, and the 5 Firecracker artifacts never enter
-an image at all. `fetch-artifacts` writes them onto the machine and the
-orchestrator reads them there.
+says which image it runs. 3 things the picture leaves out: the ClickHouse,
+Vector and collector configs are inlined into
+[`compose/compose.yaml`](../compose/compose.yaml) rather than shipped in an
+image; the 5 Firecracker artifacts never enter an image at all, since
+`fetch-artifacts` writes them onto the machine and the orchestrator reads them
+there; and the opt-in `otel-collector` service, an 11th image pulled
+ready-made, is not drawn.
 
 ## Beyond the first sandbox
 
@@ -193,7 +284,7 @@ without a tunnel.
 | `make lint` | render the compose file and the kustomization, validate the Vector config and the Terraform module, shellcheck the scripts and the tests |
 | `make test` | run the bats suite in `tests/` |
 | `make stores-check` | the store-level integration check |
-| `make sync-configs` | re-inline the 2 configs into the compose file |
+| `make sync-configs` | re-inline the 3 configs into the compose file |
 
 ### What the targets need
 
@@ -205,8 +296,9 @@ which `tests/kubernetes.bats` renders the manifest with.
 terraform.
 
 Both also need a working Docker daemon with the compose plugin, and `jq` on
-`PATH`. `make lint` renders `compose/compose.yaml` and validates the Vector
-config with the Vector image (`make vector-validate`).
+`PATH`. `make lint` renders `compose/compose.yaml`, validates the Vector
+config with the Vector image (`make vector-validate`) and the collector's
+with the collector image `compose.yaml` pins (`make otel-validate`).
 `tests/inline-configs.bats` diffs the rendered inline configs against the
 copies under `compose/config/`. `tests/vector-rows.bats` replays the fixture
 log lines in `tests/fixtures/vector/` through the shipped Vector config with
@@ -219,13 +311,15 @@ into in step with each other.
 
 ### Inline configs
 
-After editing `compose/config/vector/vector.toml` or
-`compose/config/clickhouse/config.xml`, run `make sync-configs` (python3). It
-rewrites the inline copies in `compose/compose.yaml` and the
-`VECTOR_CONFIG_SHA256` and `CLICKHOUSE_CONFIG_SHA256` stamps. The stamps make
+After editing `compose/config/vector/vector.toml`,
+`compose/config/clickhouse/config.xml` or
+`compose/config/otel/otel-collector.yaml`, run `make sync-configs` (python3).
+It rewrites the inline copies in `compose/compose.yaml`, the
+`VECTOR_CONFIG_SHA256`, `CLICKHOUSE_CONFIG_SHA256` and `OTEL_CONFIG_SHA256`
+stamps, and the Kubernetes copies under `kubernetes/config/`. The stamps make
 Compose recreate the container on a config change, which it does not do for
 inline `configs:` content on its own. `tests/config-hashes.bats` fails until
-the stamps match.
+the stamps match, and `tests/kubernetes.bats` until the copies do.
 
 ### The stores check
 

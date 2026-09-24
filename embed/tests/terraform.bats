@@ -36,15 +36,18 @@ setup() {
   [ "$status" -eq 1 ]
 }
 
-# The startup script deletes five keys from the shipped .env and appends its
+# The startup script deletes seven keys from the shipped .env and appends its
 # own, which is what puts a Terraform install on the secrets in its state and
-# the sizing its variables ask for. compose.yaml reads each of them as
-# ${KEY:-...}, so renaming one there and not here would silently drop the
-# appended line: the file still parses, the stack still starts, and the
-# install runs on what compose does when nothing is set -- its own generated
-# team key and api secrets, which the state does not know, or the hugepage
-# default rather than the requested one.
-@test "the startup script writes only .env keys compose.yaml reads" {
+# the sizing and telemetry its variables ask for. compose.yaml reads each of
+# them but one as ${KEY:-...}, so renaming one there and not here would
+# silently drop the appended line: the file still parses, the stack still
+# starts, and the install runs on what compose does when nothing is set -- its
+# own generated team key and api secrets, which the state does not know, or
+# the hugepage default rather than the requested one. The one is
+# COMPOSE_PROFILES, which Compose itself reads from the project's .env and
+# compose.yaml never interpolates; what has to exist for it is the profile the
+# module writes into it.
+@test "the startup script writes only .env keys the compose project reads" {
   keys="$(awk '/^  cat >> \.env <<EOF$/ { f = 1; next } f && /^EOF$/ { exit } f' \
     startup.sh.tftpl | sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p')"
   # An anchor that stopped matching would pass the test vacuously.
@@ -63,12 +66,61 @@ setup() {
   }
 
   while read -r key; do
+    if [ "$key" = COMPOSE_PROFILES ]; then
+      grep -qF 'var.otel_collector ? "otel" : ""' main.tf || {
+        echo "main.tf no longer writes COMPOSE_PROFILES as otel or nothing"
+        return 1
+      }
+      grep -qxF '    profiles: [otel]' ../../compose/compose.yaml || {
+        echo "the startup script can turn on the otel profile, which no compose.yaml service has"
+        return 1
+      }
+      continue
+    fi
     # -F: the literal contains `$`, which macOS grep reads as an anchor.
     grep -qF "\${$key" ../../compose/compose.yaml || {
       echo "the startup script appends $key, which compose.yaml never reads"
       return 1
     }
   done <<<"$keys"
+}
+
+# Two variables, one setting: an endpoint of the operator's own wins, and the
+# built-in collector implies its own loopback address when none is given.
+@test "the collector variables reach the instance's .env" {
+  # shellcheck disable=SC2016  # the ${...} are the template's, matched literally with -F
+  grep -qxF 'E2B_OTEL_COLLECTOR_GRPC_ENDPOINT=${otel_endpoint}' startup.sh.tftpl
+  # shellcheck disable=SC2016
+  grep -qxF 'COMPOSE_PROFILES=${compose_profiles}' startup.sh.tftpl
+  # Squeezed, so the alignment `terraform fmt` picks does not matter.
+  tr -s ' ' < main.tf | grep -qF 'otel_endpoint = var.otel_collector_grpc_endpoint != "" ? var.otel_collector_grpc_endpoint : (var.otel_collector ? "127.0.0.1:4317" : "")'
+  tr -s ' ' < main.tf | grep -qF 'compose_profiles = var.otel_collector ? "otel" : ""'
+  for var in otel_collector_grpc_endpoint otel_collector; do
+    grep -qx "variable \"$var\" {" variables.tf || { echo "variables.tf has no $var"; return 1; }
+    grep -qF "| \`$var\` |" README.md || { echo "the README's variables table has no $var"; return 1; }
+  done
+  # The address the built-in collector implies is the one its receiver binds.
+  grep -qx '        endpoint: 127.0.0.1:4317' ../../compose/config/otel/otel-collector.yaml
+}
+
+# The services take host:port and nothing else, and the value lands unquoted
+# in the instance's .env at first boot, so the variable refuses anything else
+# at plan time rather than after a replace. Checked with the rule's own
+# regex, which ERE reads the way Terraform's RE2 does.
+@test "the endpoint variable takes host:port and refuses a URL" {
+  re="$(sed -n 's/.*can(regex("\(.*\)", var\.otel_collector_grpc_endpoint)).*/\1/p' variables.tf |
+    sed 's/\\\\/\\/g')"
+  # A pattern that stopped matching would pass the refusals vacuously.
+  [ -n "$re" ]
+  grep -qF 'condition     = var.otel_collector_grpc_endpoint == "" ||' variables.tf
+  for ok in collector:4317 10.0.0.5:4317 '[::1]:4317' 127.0.0.1:4317; do
+    grep -qE "$re" <<<"$ok" || { echo "refuses $ok"; return 1; }
+  done
+  # shellcheck disable=SC2016  # a literal $(...), which the heredoc would run
+  for bad in http://collector:4317 collector collector:4317/ 'a b:1' '$(id):1'; do
+    run grep -qE "$re" <<<"$bad"
+    [ "$status" -eq 1 ] || { echo "accepts $bad"; return 1; }
+  done
 }
 
 # The comment at the top of firewall.tf is the whole reasoning for the one rule

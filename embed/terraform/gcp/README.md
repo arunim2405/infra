@@ -203,6 +203,18 @@ it was created with, which has no dashboard, until that replace.
 commit instead of the files the module ships, for example
 `https://raw.githubusercontent.com/e2b-dev/runtime/<commit>/embed/compose`.
 
+### Telemetry
+
+`otel_collector = true` runs the built-in OpenTelemetry collector on the
+instance, keeping the sandbox and team metrics behind the dashboard's
+monitoring charts in its own ClickHouse, and `otel_collector_grpc_endpoint`
+sends the services' metrics, traces and logs to a collector of your own. Set
+one or the other: with both, the services export to your endpoint and the
+built-in collector receives nothing, so the dashboard's charts stay empty.
+Both reach the instance's `.env` at first boot only, so changing either later
+takes the replace under Upgrading; the reference's
+[Observability](../../docs/REFERENCE.md#observability) has the rest.
+
 ### Limitations
 
 - No persistent data disk. Every recreate or replace starts from a fresh
@@ -231,6 +243,8 @@ commit instead of the files the module ships, for example
 | `hugepages` | `2048` | 2 MiB hugepages reserved for sandboxes; 2048 is 4 GiB |
 | `team_api_key` | generated | `e2b_` plus an even number of lowercase hex characters, at least 32 |
 | `compose_base_url` | the shipped files | a directory URL to fetch the two files from at first boot |
+| `otel_collector_grpc_endpoint` | empty | host:port of an OTLP/gRPC collector the services export metrics, traces and logs to, with no scheme; empty disables export unless `otel_collector` is on |
+| `otel_collector` | `false` | run the built-in collector on the instance, writing sandbox and team metrics into its own ClickHouse; implies `127.0.0.1:4317` when the endpoint is empty |
 | `labels` | `{}` | labels for the instance template and the address |
 
 | Output | What it is |

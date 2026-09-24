@@ -56,6 +56,11 @@ deployment see [e2b.dev/enterprise](https://e2b.dev/enterprise).
   each one. Those reach the sandbox through the header routing above, at
   the address in `E2B_DASHBOARD_HOST` (default `localhost`); set it when a
   browser on another machine opens the dashboard without a tunnel.
+- **OpenTelemetry out.** One setting sends the E2B services' metrics, traces
+  and logs to your collector. Point it at the built-in one, a second line
+  away, to keep the metrics the dashboard's charts draw. The
+  [reference](docs/REFERENCE.md#observability) says what each choice gives
+  you.
 - **One version everywhere.** Embed is released at the platform version once
   that release is tagged, and that release moves every platform pin in
   [`compose/.env`](compose/.env) and the kustomization. To pin an install, pin
@@ -90,9 +95,9 @@ network edge.
 | 5109 | api | the machine only | edge gRPC |
 
 Port 5008 is the one to guard most: nothing authenticates it, and anyone who
-reaches it has the whole orchestrator. The stores, Vector and the pprof
-endpoints stay on loopback; [What runs where](docs/REFERENCE.md#what-runs-where)
-lists them.
+reaches it has the whole orchestrator. The stores, Vector, the built-in
+collector and the pprof endpoints stay on loopback;
+[What runs where](docs/REFERENCE.md#what-runs-where) lists them.
 
 ## Not supported
 
@@ -116,7 +121,7 @@ lists them.
   tests.
 - `make test` runs the bats suite in `tests/`.
 - `make stores-check` runs the store-level integration check.
-- `make sync-configs` re-inlines the 2 configs into the compose file.
+- `make sync-configs` re-inlines the 3 configs into the compose file.
 
 What each target needs, and when the stack images have to be rebuilt, is in
 [Developing](docs/REFERENCE.md#developing).
@@ -124,5 +129,6 @@ What each target needs, and when the stack images have to be rebuilt, is in
 ## Reference
 
 [`docs/REFERENCE.md`](docs/REFERENCE.md) has the rest: what runs where and in
-which order, how logs reach ClickHouse, the secrets each shape holds, how
-images and pins are released, building templates, and the developer tooling.
+which order, how logs and metrics reach ClickHouse, the secrets each shape
+holds, how images and pins are released, building templates, and the
+developer tooling.

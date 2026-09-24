@@ -49,6 +49,12 @@ configMapGenerator:
       - E2B_KERNEL_VERSION=vmlinux-6.1.177_5008931
       - E2B_FIRECRACKER_VERSION=v1.14-0.2.0
       - E2B_BUSYBOX_VERSION=1.36.1
+  - name: e2b-settings
+    literals:
+      # host:port of an OpenTelemetry collector the api, orchestrator,
+      # client-proxy and dashboard-api export to over OTLP/gRPC, for example
+      # 127.0.0.1:4317. Empty exports nothing; set it and re-apply.
+      - OTEL_COLLECTOR_GRPC_ENDPOINT=
   - name: clickhouse-config
     files:
       - config.xml=config/clickhouse-config.xml
@@ -57,3 +63,11 @@ configMapGenerator:
   - name: vector-config
     files:
       - vector.toml=config/vector.toml
+  # Mounted only by patches/otel-collector.yaml. Generated either way, since an
+  # unused map is harmless and it keeps turning the collector on to one line.
+  - name: otel-config
+    files:
+      - config.yaml=config/otel-collector.yaml
+
+# Uncomment for the built-in collector, then set e2b-settings above to 127.0.0.1:4317.
+# patches: [{ path: patches/otel-collector.yaml, target: { kind: StatefulSet, name: e2b } }]

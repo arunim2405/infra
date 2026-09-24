@@ -165,6 +165,8 @@ spec:
             - { name: REDIS_URL, value: 127.0.0.1:6379 }
             - { name: CLICKHOUSE_CONNECTION_STRING, value: "clickhouse://clickhouse:clickhouse@127.0.0.1:9000/default" }
             - { name: LOGS_COLLECTOR_ADDRESS, value: "http://127.0.0.1:20006" }
+            # The kustomization's e2b-settings map; empty exports nothing.
+            - { name: OTEL_COLLECTOR_GRPC_ENDPOINT, valueFrom: { configMapKeyRef: { name: e2b-settings, key: OTEL_COLLECTOR_GRPC_ENDPOINT } } }
             - { name: TEMPLATE_STORAGE_URL, value: "file:///var/lib/e2b/storage/templates" }
             - { name: BUILD_CACHE_STORAGE_URL, value: "file:///var/lib/e2b/storage/build-cache" }
             - { name: ARTIFACTS_REGISTRY_PROVIDER, value: Local }
@@ -207,6 +209,7 @@ spec:
             - { name: CLICKHOUSE_CONNECTION_STRING, value: "clickhouse://clickhouse:clickhouse@127.0.0.1:9000/default" }
             - { name: LOGS_READ_CONFIG, value: "true" }
             - { name: LOGS_COLLECTOR_ADDRESS, value: "http://127.0.0.1:20006" }
+            - { name: OTEL_COLLECTOR_GRPC_ENDPOINT, valueFrom: { configMapKeyRef: { name: e2b-settings, key: OTEL_COLLECTOR_GRPC_ENDPOINT } } }
             - { name: API_INTERNAL_GRPC_PORT, value: "5009" }
             - { name: API_EDGE_GRPC_PORT, value: "5109" }
             - { name: PPROF_PORT, value: "6060" }
@@ -229,6 +232,7 @@ spec:
             - { name: API_INTERNAL_GRPC_ADDRESS, value: 127.0.0.1:5009 }
             - { name: PROXY_PORT, value: "3002" }
             - { name: HEALTH_PORT, value: "3003" }
+            - { name: OTEL_COLLECTOR_GRPC_ENDPOINT, valueFrom: { configMapKeyRef: { name: e2b-settings, key: OTEL_COLLECTOR_GRPC_ENDPOINT } } }
           startupProbe:
             httpGet: { host: 127.0.0.1, port: 3003, path: / }
             periodSeconds: 10
@@ -269,6 +273,7 @@ spec:
             - { name: POSTGRES_CONNECTION_STRING, value: "postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable" }
             - { name: REDIS_URL, value: 127.0.0.1:6379 }
             - { name: CLICKHOUSE_CONNECTION_STRING, value: "clickhouse://clickhouse:clickhouse@127.0.0.1:9000/default" }
+            - { name: OTEL_COLLECTOR_GRPC_ENDPOINT, valueFrom: { configMapKeyRef: { name: e2b-settings, key: OTEL_COLLECTOR_GRPC_ENDPOINT } } }
             - { name: AUTH_PROVIDER_CONFIG, value: '{"jwt":[]}' }
           startupProbe:
             httpGet: { host: 127.0.0.1, port: 3010, path: /health }

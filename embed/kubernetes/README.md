@@ -185,7 +185,8 @@ stack.
 ### Ports
 
 The node exposes the same thirteen ports as a compose host, and Postgres,
-Redis, ClickHouse and Vector listen on loopback here too. The SDK variables
+Redis, ClickHouse and Vector listen on loopback here too, as does the
+collector under Telemetry once it is patched in. The SDK variables
 `ready` prints use the node's IP: reach 3000, 3001 and 3002 on it and firewall
 the other ten (3003, 3010, 5007, 5008, 5009, 5109 and the sandbox egress
 proxies 5010, 5016, 5017 and 5018), since 5008 is an unauthenticated control
@@ -231,6 +232,70 @@ documents.
 The dashboard keeps the key you paste in an httpOnly browser cookie for a
 year, not marked Secure because the node serves plain http; sign-out
 clears it.
+
+### Telemetry
+
+api, the orchestrator, client-proxy and dashboard-api take their OpenTelemetry
+collector from the `OTEL_COLLECTOR_GRPC_ENDPOINT` literal of the
+`e2b-settings` ConfigMap in [`kustomization.yaml`](kustomization.yaml). It
+ships empty, which exports nothing; `127.0.0.1:4317`, or any `host:port` the
+node can reach, sends their metrics, traces and logs there over OTLP/gRPC.
+The built-in collector, the compose `otel` profile's service, is the one
+commented line at the end of that file:
+
+```yaml
+# patches: [{ path: patches/otel-collector.yaml, target: { kind: StatefulSet, name: e2b } }]
+```
+
+From a checkout, set the literal to `127.0.0.1:4317`, uncomment that line and
+run `kubectl apply -k embed/kubernetes`.
+[`patches/otel-collector.yaml`](patches/otel-collector.yaml) appends an
+`otel-collector` sidecar after the dashboard pair, reading
+[`config/otel-collector.yaml`](config/otel-collector.yaml) from the
+`otel-config` ConfigMap, and `curl -s 127.0.0.1:13133` on the node answers
+while it runs. Unlike compose, where nothing waits for it, its startup probe
+comes before `ready`, so a collector that never answers leaves the pod
+unready. With the dashboard patch under Limitations as well, both entries go
+in the one `patches:` list.
+
+The URL install has no file to edit. An overlay of your own does the same: a
+directory holding this `kustomization.yaml` and a copy of the patch file
+(`curl -fsSLO https://raw.githubusercontent.com/e2b-dev/runtime/main/embed/kubernetes/patches/otel-collector.yaml`),
+applied with `kubectl apply -k` on that directory.
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: e2b
+resources:
+  - https://github.com/e2b-dev/runtime//embed/kubernetes?ref=main
+configMapGenerator:
+  - name: e2b-settings
+    behavior: merge
+    literals:
+      - OTEL_COLLECTOR_GRPC_ENDPOINT=127.0.0.1:4317
+patches:
+  - path: otel-collector.yaml
+    target: { kind: StatefulSet, name: e2b }
+```
+
+For a collector of your own, give its address instead and leave out
+`patches:`. The reference's
+[Observability](../docs/REFERENCE.md#observability) says what the built-in
+collector keeps and what reads it.
+
+The built-in collector discards traces and logs. To forward them from the
+overlay, copy its config in as well
+(`curl -fsSL --create-dirs -o config/otel-collector.yaml https://raw.githubusercontent.com/e2b-dev/runtime/main/embed/kubernetes/config/otel-collector.yaml`),
+make the edit its comments describe, and replace the `otel-config` ConfigMap
+with that copy through one more entry under `configMapGenerator:`:
+
+```yaml
+  - name: otel-config
+    behavior: replace
+    files:
+      - config.yaml=config/otel-collector.yaml
+```
 
 ### Upgrading
 
