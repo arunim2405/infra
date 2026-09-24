@@ -478,9 +478,12 @@ var (
 	OrchestratorRoutingPublishFlag = NewBoolFlag("orchestrator-routing-publish", true)
 	// OrchestratorRoutingPrioritizedFlag makes client-proxy resolve the node
 	// from the orchestrator-owned sandbox:routing:{id} record instead of the
-	// API-owned sandbox:catalog:{id} record. Turn on only after
-	// OrchestratorRoutingPublishFlag has been on for one max sandbox length.
-	OrchestratorRoutingPrioritizedFlag = NewBoolFlag("orchestrator-routing-prioritized", false)
+	// API-owned sandbox:catalog:{id} record. On by default: every orchestrator
+	// must run a build with OrchestratorRoutingPublishFlag on for at least one
+	// max sandbox length before client-proxy picks this up, or requests for
+	// older sandboxes miss and fall to the resume path. Turn off in
+	// LaunchDarkly to read the API-owned record again.
+	OrchestratorRoutingPrioritizedFlag = NewBoolFlag("orchestrator-routing-prioritized", true)
 	MaxCacheWriterConcurrencyFlag      = NewIntFlag("max-cache-writer-concurrency", 10)
 
 	// BuildCacheMaxUsagePercentage the maximum percentage of the cache disk storage
