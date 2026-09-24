@@ -747,6 +747,37 @@ func TestAdmit_PinnedBranchClosesExpiredOtherInstance(t *testing.T) {
 	assert.Same(t, pinned, item.Value())
 }
 
+// A lookup for a build whose pinned template has left the TTL cache must serve
+// and pin that template, not admit the candidate, and its release must drop
+// only its own pin.
+func TestAdmit_PinnedBranchPinsTheServedTemplate(t *testing.T) {
+	t.Parallel()
+
+	c, _ := newPinTestCache(time.Hour)
+	pinned := newPinTestTemplate(t, "build-pinned-lookup")
+	releaseFirst := pinForTest(t, c, pinned)
+
+	candidate := newPinTestTemplate(t, pinned.key)
+	got, found, releaseLookup := c.lookupOrAdmit(t.Context(), pinned.key, candidate, time.Hour, true)
+
+	assert.True(t, found)
+	assert.Same(t, pinned, got, "the pinned template must be served")
+	assert.Equal(t, int64(2), c.footprint().pinnedRefs, "the lookup must take its own pin")
+
+	item := c.cache.Get(pinned.key, ttlcache.WithDisableTouchOnHit[string, Template]())
+	require.NotNil(t, item, "the pinned template must be re-admitted")
+	assert.Same(t, pinned, item.Value())
+
+	releaseLookup()
+	assert.True(t, c.isPinned(pinned.key), "the lookup's release must not drop the first pin")
+	assert.Equal(t, int64(1), c.footprint().pinnedRefs)
+
+	releaseFirst()
+	assert.False(t, c.isPinned(pinned.key))
+	assert.Zero(t, pinned.closes.Load())
+	assert.Zero(t, candidate.closes.Load())
+}
+
 // The eviction callback must not hold extendMu across Close. extendMu is taken
 // on every sandbox create and resume, and closeTemplate waits on the template's
 // futures with no deadline, so a Close that blocks under the lock is a
