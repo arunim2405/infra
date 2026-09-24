@@ -585,6 +585,168 @@ func TestEvict_ClosesWhenKeyIsFree(t *testing.T) {
 	}
 }
 
+// The janitor is not started, so the expired entry stays unswept.
+func TestAdmit_ExpiredUnsweptEntryIsClosed(t *testing.T) {
+	t.Parallel()
+
+	c, evicted := newPinTestCache(time.Hour)
+	expired := newPinTestTemplate(t, "build-expired")
+	c.cache.Set(expired.key, expired, time.Millisecond)
+
+	require.Eventually(t, func() bool { return !c.cache.Has(expired.key) },
+		5*time.Second, time.Millisecond, "entry never expired")
+
+	fresh := newPinTestTemplate(t, expired.key)
+	got, found, release := c.lookupOrAdmit(t.Context(), fresh.key, fresh, time.Hour, false)
+	defer release()
+
+	assert.False(t, found, "an expired entry must not be served")
+	assert.Same(t, fresh, got)
+
+	waitEvicted(t, evicted, expired.key)
+
+	assert.Equal(t, int32(1), expired.closes.Load(), "the displaced instance must be closed")
+	assert.False(t, expired.snapfileExists())
+	assert.Zero(t, fresh.closes.Load(), "the admitted instance must survive its predecessor's eviction")
+	assert.True(t, fresh.snapfileExists())
+}
+
+// The entry must expire after the lookup has started but before it admits,
+// which extendMu does not prevent. Holding pinMu parks the lookup inside that
+// window, at its pinned-template check, until the entry has expired. It guards
+// against checking expiry separately from the admission.
+func TestAdmit_EntryExpiringDuringLookupIsClosed(t *testing.T) {
+	t.Parallel()
+
+	c, evicted := newPinTestCache(time.Hour)
+	expiring := newPinTestTemplate(t, "build-expiring")
+	c.cache.Set(expiring.key, expiring, 300*time.Millisecond)
+
+	c.pinMu.Lock()
+
+	type result struct {
+		got     Template
+		found   bool
+		release func()
+	}
+	done := make(chan result, 1)
+	fresh := newPinTestTemplate(t, expiring.key)
+	ctx := t.Context()
+	go func() {
+		got, found, release := c.lookupOrAdmit(ctx, fresh.key, fresh, time.Hour, false)
+		done <- result{got, found, release}
+	}()
+
+	require.Eventually(t, func() bool {
+		if c.extendMu.TryLock() {
+			c.extendMu.Unlock()
+
+			return false
+		}
+
+		return true
+	}, 5*time.Second, time.Millisecond, "the lookup never started")
+	require.Eventually(t, func() bool { return !c.cache.Has(expiring.key) },
+		5*time.Second, time.Millisecond, "entry never expired")
+
+	c.pinMu.Unlock()
+
+	r := <-done
+	defer r.release()
+
+	assert.False(t, r.found, "an expired entry must not be served")
+	assert.Same(t, fresh, r.got)
+
+	waitEvicted(t, evicted, expiring.key)
+
+	assert.Equal(t, int32(1), expiring.closes.Load(), "the displaced instance must be closed")
+	assert.Zero(t, fresh.closes.Load(), "the admitted instance must survive its predecessor's eviction")
+}
+
+// setExpired caches tmpl under key and waits until the entry has expired. The
+// janitor is not started, so the entry stays unswept.
+func setExpired(t *testing.T, c *Cache, key string, tmpl Template) {
+	t.Helper()
+
+	c.cache.Set(key, tmpl, time.Millisecond)
+	require.Eventually(t, func() bool { return !c.cache.Has(key) },
+		5*time.Second, time.Millisecond, "entry never expired")
+}
+
+func TestRelease_ExpiredOtherInstanceIsClosed(t *testing.T) {
+	t.Parallel()
+
+	c, evicted := newPinTestCache(time.Hour)
+	pinned := newPinTestTemplate(t, "build-release-other")
+	release := pinForTest(t, c, pinned)
+
+	stale := newPinTestTemplate(t, pinned.key)
+	setExpired(t, c, pinned.key, stale)
+
+	release()
+	waitEvicted(t, evicted, pinned.key)
+
+	assert.Equal(t, int32(1), stale.closes.Load(), "the displaced instance must be closed")
+	assert.False(t, stale.snapfileExists())
+
+	item := c.cache.Get(pinned.key, ttlcache.WithDisableTouchOnHit[string, Template]())
+	require.NotNil(t, item, "the released template must be re-admitted")
+	assert.Same(t, pinned, item.Value())
+	assert.Zero(t, pinned.closes.Load())
+}
+
+// Deleting the expired entry queues onEvicted for the very instance being
+// re-admitted, so its snapfile survives only through onEvicted's re-admit guard.
+func TestRelease_ExpiredSameInstanceIsReadmitted(t *testing.T) {
+	t.Parallel()
+
+	c, evicted := newPinTestCache(time.Hour)
+	tmpl := newPinTestTemplate(t, "build-release-same")
+	release := pinForTest(t, c, tmpl)
+	setExpired(t, c, tmpl.key, tmpl)
+
+	release()
+	waitEvicted(t, evicted, tmpl.key)
+
+	assert.Zero(t, tmpl.closes.Load(), "the re-admitted instance must not be closed")
+	assert.True(t, tmpl.snapfileExists())
+
+	item := c.cache.Get(tmpl.key, ttlcache.WithDisableTouchOnHit[string, Template]())
+	require.NotNil(t, item, "the released template must be re-admitted")
+	assert.Same(t, tmpl, item.Value())
+	assert.LessOrEqual(t, item.TTL(), unpinnedGraceTTL)
+}
+
+func TestAdmit_PinnedBranchClosesExpiredOtherInstance(t *testing.T) {
+	t.Parallel()
+
+	c, evicted := newPinTestCache(time.Hour)
+	pinned := newPinTestTemplate(t, "build-pinned-other")
+	release := pinForTest(t, c, pinned)
+	defer release()
+
+	stale := newPinTestTemplate(t, pinned.key)
+	setExpired(t, c, pinned.key, stale)
+
+	candidate := newPinTestTemplate(t, pinned.key)
+	got, found, releaseLookup := c.lookupOrAdmit(t.Context(), pinned.key, candidate, time.Hour, false)
+	defer releaseLookup()
+
+	assert.True(t, found)
+	assert.Same(t, pinned, got, "the pinned template must be served")
+
+	waitEvicted(t, evicted, pinned.key)
+
+	assert.Equal(t, int32(1), stale.closes.Load(), "the displaced instance must be closed")
+	assert.False(t, stale.snapfileExists())
+	assert.Zero(t, pinned.closes.Load())
+	assert.Zero(t, candidate.closes.Load())
+
+	item := c.cache.Get(pinned.key, ttlcache.WithDisableTouchOnHit[string, Template]())
+	require.NotNil(t, item)
+	assert.Same(t, pinned, item.Value())
+}
+
 // The eviction callback must not hold extendMu across Close. extendMu is taken
 // on every sandbox create and resume, and closeTemplate waits on the template's
 // futures with no deadline, so a Close that blocks under the lock is a

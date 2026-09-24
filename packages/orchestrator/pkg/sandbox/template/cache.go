@@ -426,9 +426,7 @@ func (c *Cache) release(ctx context.Context, e *pinnedEntry, tok uint64) {
 		// this cache already has. The grace exists only so a resume arriving
 		// moments later still hits, and so the eventual eviction runs Close and
 		// releases the files.
-		if c.cache.Get(e.key, ttlcache.WithDisableTouchOnHit[string, Template]()) == nil {
-			c.cache.Set(e.key, e.tmpl, unpinnedGraceTTL)
-		}
+		c.getOrAdmitLocked(e.key, e.tmpl, unpinnedGraceTTL, ttlcache.WithDisableTouchOnHit[string, Template]())
 
 		c.extendMu.Unlock()
 
@@ -451,6 +449,22 @@ func (c *Cache) release(ctx context.Context, e *pinnedEntry, tok uint64) {
 				zap.String("item_key", e.key), zap.Error(err))
 		}
 	}()
+}
+
+// getOrAdmitLocked returns key's live entry, or admits t. ttlcache's GetOrSet
+// would overwrite an expired, unswept entry in place without firing
+// OnEviction, leaving its template unclosed; deleting it first routes it
+// through onEvicted. The caller must hold extendMu: every admission does, and
+// writers outside it only sweep expired entries or touch live ones, so the miss
+// cannot go stale before the Set.
+func (c *Cache) getOrAdmitLocked(key string, t Template, ttl time.Duration, opts ...ttlcache.Option[string, Template]) (*ttlcache.Item[string, Template], bool) {
+	if item := c.cache.Get(key, opts...); item != nil {
+		return item, true
+	}
+
+	c.cache.Delete(key)
+
+	return c.cache.Set(key, t, ttl), false
 }
 
 // pinnedTemplate returns the pinned template for key, if any. Retired entries
@@ -1142,15 +1156,13 @@ func (c *Cache) lookupOrAdmit(ctx context.Context, key string, candidate Templat
 	defer c.extendMu.Unlock()
 
 	// A pinned template is authoritative even if it has left the TTL cache.
-	// Without this, an eviction while pinned would let the GetOrSet below insert
+	// Without this, an eviction while pinned would let the admission below insert
 	// the caller's freshly built candidate and Fetch it — producing a second live
 	// Template for the same build, with two sets of devices over the same files.
 	if pinnedTmpl, ok := c.pinnedTemplate(key); ok {
 		// Re-admit it so it is visible to plain cache lookups again. Guarded:
 		// never displace a different live entry that took this key meanwhile.
-		if c.cache.Get(key) == nil {
-			c.cache.Set(key, pinnedTmpl, ttl)
-		}
+		c.getOrAdmitLocked(key, pinnedTmpl, ttl)
 
 		if pin {
 			release = c.pinLocked(ctx, pinnedTmpl)
@@ -1159,9 +1171,10 @@ func (c *Cache) lookupOrAdmit(ctx context.Context, key string, candidate Templat
 		return pinnedTmpl, true, release
 	}
 
-	item, found := c.cache.GetOrSet(key, candidate, ttlcache.WithTTL[string, Template](ttl))
+	item, found := c.getOrAdmitLocked(key, candidate, ttl)
 	if found && item.TTL() < ttl {
 		// Another team with a shorter max length cached this entry; extend it.
+		// A plain Set is safe: it writes back the same template.
 		c.cache.Set(key, item.Value(), ttl)
 	}
 

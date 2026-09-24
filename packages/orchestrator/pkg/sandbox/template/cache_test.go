@@ -18,7 +18,7 @@ func newTestCache(defaultTTL time.Duration) *Cache {
 	}
 }
 
-// simulateGetTemplate mimics getTemplateWithFetch's lock-protected TTL logic
+// simulateGetTemplate runs getTemplateWithFetch's TTL computation and admission
 // without needing a full storageTemplate (which requires disk paths).
 func simulateGetTemplate(c *Cache, key string, maxSandboxLengthHours int64) {
 	ttl := templateExpiration
@@ -26,12 +26,8 @@ func simulateGetTemplate(c *Cache, key string, maxSandboxLengthHours int64) {
 		ttl = max(ttl, time.Duration(maxSandboxLengthHours)*time.Hour+templateExpirationBuffer)
 	}
 
-	c.extendMu.Lock()
-	t, found := c.cache.GetOrSet(key, nil, ttlcache.WithTTL[string, Template](ttl))
-	if found && t.TTL() < ttl {
-		c.cache.Set(key, t.Value(), ttl)
-	}
-	c.extendMu.Unlock()
+	_, _, release := c.lookupOrAdmit(context.Background(), key, nil, ttl, false)
+	release()
 }
 
 func TestGetTemplate_ExtendsTTL(t *testing.T) {
@@ -74,6 +70,24 @@ func TestGetTemplate_NeverShortens(t *testing.T) {
 	item = c.cache.Get(key)
 	require.NotNil(t, item)
 	assert.Equal(t, longTTL, item.TTL(), "TTL must not decrease when a shorter team accesses the template")
+}
+
+func TestGetTemplate_HitRestartsExpiry(t *testing.T) {
+	t.Parallel()
+
+	c := newTestCache(time.Hour)
+	key := "build-touch"
+	before := c.cache.Set(key, nil, time.Hour).ExpiresAt()
+
+	time.Sleep(5 * time.Millisecond)
+
+	_, found, release := c.lookupOrAdmit(t.Context(), key, nil, time.Hour, false)
+	release()
+	require.True(t, found)
+
+	item := c.cache.Get(key, ttlcache.WithDisableTouchOnHit[string, Template]())
+	require.NotNil(t, item)
+	assert.True(t, item.ExpiresAt().After(before), "a hit must restart the entry's expiry")
 }
 
 func TestGetTemplate_DefaultTTLForZero(t *testing.T) {
