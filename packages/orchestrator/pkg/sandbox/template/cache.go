@@ -442,9 +442,9 @@ func (c *Cache) release(ctx context.Context, e *pinnedEntry, tok uint64) {
 	//
 	// An eviction callback for this instance may be queued behind us — Invalidate
 	// deletes the cache entry before retiring the pin — and will find nothing
-	// holding it and close it too. That is harmless: the futures are already
-	// resolved, the devices' Close is a no-op, and both os.RemoveAll calls
-	// succeed on an already-removed path.
+	// holding it and close it too, possibly while this Close is still running.
+	// storageTemplate.Close runs its teardown once and makes every other caller
+	// wait for that result, so the second close does nothing.
 	go func() {
 		if err := e.tmpl.Close(ctx); err != nil {
 			logger.L().Warn(ctx, "failed to cleanup invalidated template data",

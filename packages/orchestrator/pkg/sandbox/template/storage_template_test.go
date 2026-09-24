@@ -3,6 +3,9 @@
 package template
 
 import (
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +15,7 @@ import (
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 	blockmocks "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block/mocks"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
@@ -239,4 +243,78 @@ func TestStorageTemplate_HeaderFootprintCountsSharedMappingOnce(t *testing.T) {
 	assert.Equal(t, source.Mapping.Len()+rootfsHdr.Mapping.Len(), entries,
 		"the shared mapping must be counted once, not once per header")
 	assert.Equal(t, source.Mapping.ByteSize()+rootfsHdr.Mapping.ByteSize(), bytes)
+}
+
+type countingFile struct {
+	path   string
+	closes atomic.Int32
+}
+
+func (f *countingFile) Path() string { return f.path }
+
+func (f *countingFile) Close() error {
+	f.closes.Add(1)
+
+	return nil
+}
+
+// The cache can close one instance from two paths at once: a retired entry's
+// last release and the eviction callback Invalidate queued. The teardown must
+// run once however many callers race for it, and each caller must see it
+// finished before Close returns.
+func TestStorageTemplate_CloseRunsOnce(t *testing.T) {
+	t.Parallel()
+
+	paths, err := storage.Paths{BuildID: uuid.NewString()}.Cache(storage.Config{TemplateCacheDir: t.TempDir()})
+	require.NoError(t, err)
+
+	var memCloses, rootfsCloses atomic.Int32
+	memDev := blockmocks.NewMockReadonlyDevice(t)
+	memDev.EXPECT().Close().RunAndReturn(func() error {
+		memCloses.Add(1)
+
+		return nil
+	}).Maybe()
+	rootfsDev := blockmocks.NewMockReadonlyDevice(t)
+	rootfsDev.EXPECT().Close().RunAndReturn(func() error {
+		rootfsCloses.Add(1)
+
+		return nil
+	}).Maybe()
+	snapfile := &countingFile{path: paths.CacheSnapfile()}
+
+	tmpl := &storageTemplate{
+		paths:    paths,
+		memfile:  utils.NewSetOnce[block.ReadonlyDevice](),
+		rootfs:   utils.NewSetOnce[block.ReadonlyDevice](),
+		snapfile: utils.NewSetOnce[File](),
+	}
+	require.NoError(t, tmpl.memfile.SetValue(memDev))
+	require.NoError(t, tmpl.rootfs.SetValue(rootfsDev))
+	require.NoError(t, tmpl.snapfile.SetValue(snapfile))
+
+	const callers = 8
+
+	start := make(chan struct{})
+	errs := make([]error, callers)
+
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Go(func() {
+			<-start
+			errs[i] = tmpl.Close(t.Context())
+		})
+	}
+
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		require.NoError(t, err, "caller %d", i)
+	}
+
+	assert.Equal(t, int32(1), memCloses.Load(), "memfile closed more than once")
+	assert.Equal(t, int32(1), rootfsCloses.Load(), "rootfs closed more than once")
+	assert.Equal(t, int32(1), snapfile.closes.Load(), "snapfile closed more than once")
+	assert.NoDirExists(t, filepath.Dir(paths.CacheSnapfile()))
 }

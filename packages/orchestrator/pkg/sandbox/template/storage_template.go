@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -46,6 +47,9 @@ type storageTemplate struct {
 
 	metrics     blockmetrics.Metrics
 	persistence storage.StorageProvider
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func newTemplateFromStorage(
@@ -289,7 +293,17 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 	}
 }
 
+// Close is idempotent and safe to call concurrently. The cache can reach one
+// instance from more than one close path — a retired entry's last release and
+// an eviction callback queued by Invalidate — so the teardown runs once and
+// every caller gets its result.
 func (t *storageTemplate) Close(ctx context.Context) error {
+	t.closeOnce.Do(func() { t.closeErr = t.close(ctx) })
+
+	return t.closeErr
+}
+
+func (t *storageTemplate) close(ctx context.Context) error {
 	err := closeTemplate(ctx, t)
 
 	// closeTemplate only removes the files it holds handles for, which leaves the
