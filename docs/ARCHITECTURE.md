@@ -143,11 +143,10 @@ The control-plane entry point (Gin, OpenAPI-generated from `spec/openapi.yml`, p
   is on by default (`BEST_OF_K_HUGEPAGE_MEMORY`); set it false to rank on
   CPU alone. K, overcommit ratio, and alpha are tunable live via feature
   flags.
-- **State**: writes sandbox records to Redis (source of truth for *running* sandboxes) and the
-  sandbox→node **routing catalog** (`sandbox:catalog:{id}`) in Redis that client-proxy reads. This
-  API-written record is the default routing source; the orchestrator-written
-  `sandbox:routing:{id}` is a flag-gated alternative (see "Sandbox routing records"). Persistent
-  entities (templates, builds, snapshots, teams) live in Postgres.
+- **State**: writes sandbox records to Redis (source of truth for *running* sandboxes) and a
+  legacy sandbox→node **routing catalog** (`sandbox:catalog:{id}`) in Redis. client-proxy no
+  longer reads it; it reads the orchestrator-written `sandbox:routing:{id}` (see "Sandbox routing
+  records"). Persistent entities (templates, builds, snapshots, teams) live in Postgres.
 - **Secrets**: `/secrets` is the only public surface for secret management (create, list, get,
   update, delete). The API authenticates the caller with the customer alternatives above, converts
   the authenticated team UUID to the project UUID the backend knows, checks the `customer-secrets`
@@ -302,9 +301,8 @@ looks the sandbox up in the Redis routing record to find the owning node, and re
 that node's orchestrator proxy on :5007 by default. `ORCHESTRATOR_PROXY_PORT` selects a
 different downstream port when the node proxy listens elsewhere. If the sandbox is not in the record (paused), it calls
 the API's `ResumeSandbox` gRPC and retries — paused sandboxes wake transparently on traffic.
-By default the record is the orchestrator-owned `sandbox:routing:{id}`; turning the
-`orchestrator-routing-prioritized` flag off switches the read back to the API-owned
-`sandbox:catalog:{id}` (see "Sandbox routing records" below).
+The record is the orchestrator-owned `sandbox:routing:{id}` (see "Sandbox routing records"
+below).
 
 ### Dashboard API (`packages/dashboard-api`)
 
@@ -455,36 +453,29 @@ sequenceDiagram
 ### Sandbox routing records
 
 client-proxy resolves the node IP of a sandbox from a routing record in Redis. Two records exist
-today. Both have the same JSON shape (`sandbox_catalog.SandboxInfo` in
+today; client-proxy reads only the orchestrator-owned one. Both have the same JSON shape (`sandbox_catalog.SandboxInfo` in
 `packages/shared/pkg/sandbox-catalog`): `orchestrator_id`, `orchestrator_ip`, `execution_id`,
 `sandbox_started_at`, `sandbox_max_length_in_hours`.
 
 | Record | Key | Writer | Written | Deleted |
 |---|---|---|---|---|
-| API-owned (fallback) | `sandbox:catalog:{sandboxID}` | API (cloud) or the cluster edge from gRPC metadata (BYOC) | after `Create` returns | before `Pause`/`Kill` is sent to the node |
-| Orchestrator-owned (default) | `sandbox:routing:{sandboxID}` | orchestrator, `packages/orchestrator/pkg/routing` | on `MarkRunning` (sandbox enters the live map, envd is ready) | on `MarkStopping` (kill, pause, checkpoint, crash) |
+| API-owned (legacy, unread) | `sandbox:catalog:{sandboxID}` | API (cloud) or the cluster edge from gRPC metadata (BYOC) | after `Create` returns | before `Pause`/`Kill` is sent to the node |
+| Orchestrator-owned | `sandbox:routing:{sandboxID}` | orchestrator, `packages/orchestrator/pkg/routing` | on `MarkRunning` (sandbox enters the live map, envd is ready) | on `MarkStopping` (kill, pause, checkpoint, crash) |
 
-**client-proxy reads the orchestrator-owned record by default.** It reads `sandbox:catalog:{id}`
-only when the `orchestrator-routing-prioritized` flag is off. The API still writes its record next
-to the orchestrator one, so the flag can be turned off without a gap.
+**The orchestrator-owned record is the routing source.** The orchestrator writes
+`sandbox:routing:{id}` on `MarkRunning` and deletes it on `MarkStopping`. A failed write is logged
+and counted (`orchestrator.routing.publish.total{result=error}`); the sandbox keeps running. Build
+sandboxes are skipped. The delete is guarded by `execution_id` in a Lua script, so a stale
+lifecycle never removes the record of a newer execution. client-proxy has no fallback to the
+API-owned record on a miss: a miss goes to the auto-resume path (`ResumeSandbox` gRPC to the API).
 
-Two feature flags in `packages/shared/pkg/featureflags` control the new path:
+The API-owned record is still written but no longer read. It is kept until the writers in the API
+and the cluster edge are removed.
 
-- `orchestrator-routing-publish` (orchestrator, **default on**): write `sandbox:routing:{id}` on
-  `MarkRunning` and delete it on `MarkStopping`. A failed write is logged and counted
-  (`orchestrator.routing.publish.total{result=error}`); the sandbox keeps running. Build sandboxes
-  are skipped. The delete is guarded by `execution_id` in a Lua script, so a stale lifecycle never
-  removes the record of a newer execution.
-- `orchestrator-routing-prioritized` (client-proxy, **default on**): resolve the node from `sandbox:routing:{id}`
-  instead of `sandbox:catalog:{id}`. There is no fallback to the API-owned record on a miss. A miss
-  goes to the auto-resume path (`ResumeSandbox` gRPC to the API), same as today.
-
-Deploy order: every orchestrator on the cluster must run a build with `orchestrator-routing-publish`
-on for one maximum sandbox length before client-proxy is upgraded to a build with
-`orchestrator-routing-prioritized` on by default. Otherwise requests for sandboxes started before
-the orchestrator upgrade miss the record and go to the resume path. To roll back, turn off
-`orchestrator-routing-prioritized`; the API path is untouched. Turn off
-`orchestrator-routing-publish` only to stop the extra Redis write.
+Deploy order: every orchestrator on a cluster must run a build that publishes the record for one
+maximum sandbox length before client-proxy is upgraded past the flag-gated builds. Otherwise
+requests for sandboxes started before the orchestrator upgrade miss the record and go to the
+resume path.
 
 The TTL of both records is `sandbox_max_length_in_hours` from the write time. The record is
 deleted earlier in every normal stop path.

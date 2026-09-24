@@ -2,13 +2,8 @@
 // (sandbox:routing:{sandboxID}) that client-proxy can read to reach the node.
 //
 // The record exists exactly while the sandbox is in the live registry: it is
-// written on MarkRunning and deleted on MarkStopping. Both are best-effort in
-// v1 (behind featureflags.OrchestratorRoutingPublishFlag): a failed write is
-// logged and counted, the sandbox keeps running.
-//
-// The API-owned record sandbox:catalog:{sandboxID} stays the default routing
-// source. client-proxy reads this record only when
-// featureflags.OrchestratorRoutingPrioritizedFlag is on. See
+// written on MarkRunning and deleted on MarkStopping. Both are best-effort: a
+// failed write is logged and counted, the sandbox keeps running. See
 // docs/ARCHITECTURE.md, "Sandbox routing records".
 package routing
 
@@ -23,7 +18,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
-	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	catalog "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-catalog"
 	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
@@ -58,8 +52,7 @@ type routeState struct {
 // Publisher writes the routing record for every sandbox that becomes live on
 // this node and deletes it when the sandbox stops.
 type Publisher struct {
-	store        Store
-	featureFlags *featureflags.Client
+	store Store
 
 	orchestratorID string
 	nodeIP         string
@@ -75,7 +68,6 @@ type Publisher struct {
 func New(
 	meterProvider metric.MeterProvider,
 	store Store,
-	featureFlags *featureflags.Client,
 	orchestratorID string,
 	nodeIP string,
 ) (*Publisher, error) {
@@ -93,7 +85,6 @@ func New(
 
 	return &Publisher{
 		store:          store,
-		featureFlags:   featureFlags,
 		orchestratorID: orchestratorID,
 		nodeIP:         nodeIP,
 		routes:         map[string]*routeState{},
@@ -102,8 +93,8 @@ func New(
 	}, nil
 }
 
-// OnInsert writes the routing record when the flag is on. Build sandboxes are
-// never routable and are skipped.
+// OnInsert writes the routing record. Build sandboxes are never routable and
+// are skipped.
 func (p *Publisher) OnInsert(ctx context.Context, sbx *sandbox.Sandbox) {
 	if sbx.Runtime.SandboxType != sandboxtypes.SandboxTypeSandbox {
 		return
@@ -123,12 +114,8 @@ func (p *Publisher) OnInsert(ctx context.Context, sbx *sandbox.Sandbox) {
 	}
 
 	// From here OnStopping removes the entry, so the map holds at most one
-	// entry per live sandbox, flag on or off.
+	// entry per live sandbox.
 	state.inserted = true
-
-	if !p.featureFlags.BoolFlag(ctx, featureflags.OrchestratorRoutingPublishFlag) {
-		return
-	}
 
 	info := &catalog.SandboxInfo{
 		OrchestratorID:   p.orchestratorID,

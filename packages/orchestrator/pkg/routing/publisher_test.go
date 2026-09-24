@@ -7,13 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/launchdarkly/go-server-sdk/v7/testhelpers/ldtestdata"
 	"github.com/stretchr/testify/require"
 	noopmetric "go.opentelemetry.io/otel/metric/noop"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
-	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	catalog "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-catalog"
 	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
 )
@@ -93,23 +91,10 @@ func (c *memoryCatalog) has() bool {
 	return ok
 }
 
-func newFeatureFlags(t *testing.T, publish bool) *featureflags.Client {
+func newPublisher(t *testing.T, c Store) *Publisher {
 	t.Helper()
 
-	source := ldtestdata.DataSource()
-	source.Update(source.Flag(featureflags.OrchestratorRoutingPublishFlag.Key()).VariationForAll(publish))
-
-	ff, err := featureflags.NewClientWithDatasource(source)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ff.Close(context.WithoutCancel(t.Context())) })
-
-	return ff
-}
-
-func newPublisher(t *testing.T, c Store, publish bool) *Publisher {
-	t.Helper()
-
-	p, err := New(noopmetric.NewMeterProvider(), c, newFeatureFlags(t, publish), "orch-1", "10.1.2.3")
+	p, err := New(noopmetric.NewMeterProvider(), c, "orch-1", "10.1.2.3")
 	require.NoError(t, err)
 
 	return p
@@ -147,7 +132,7 @@ func TestPublisher_OnInsertWritesRecord(t *testing.T) {
 	t.Parallel()
 
 	c := newMemoryCatalog()
-	p := newPublisher(t, c, true)
+	p := newPublisher(t, c)
 	sbx := testSandbox(t, "sbx-1", "lc-1", sandboxtypes.SandboxTypeSandbox)
 
 	p.OnInsert(t.Context(), sbx)
@@ -166,7 +151,7 @@ func TestPublisher_OnStoppingDeletesRecord(t *testing.T) {
 	t.Parallel()
 
 	c := newMemoryCatalog()
-	p := newPublisher(t, c, true)
+	p := newPublisher(t, c)
 	sbx := testSandbox(t, "sbx-1", "lc-1", sandboxtypes.SandboxTypeSandbox)
 
 	p.OnInsert(t.Context(), sbx)
@@ -176,20 +161,16 @@ func TestPublisher_OnStoppingDeletesRecord(t *testing.T) {
 	require.ErrorIs(t, err, catalog.ErrSandboxNotFound)
 }
 
-func TestPublisher_FlagOffWritesNothingAndLeaksNoState(t *testing.T) {
+func TestPublisher_OnStoppingCollectsLifecycleState(t *testing.T) {
 	t.Parallel()
 
 	c := newMemoryCatalog()
-	p := newPublisher(t, c, false)
+	p := newPublisher(t, c)
 	sbx := testSandbox(t, "sbx-1", "lc-1", sandboxtypes.SandboxTypeSandbox)
 
 	p.OnInsert(t.Context(), sbx)
-
-	_, err := c.GetSandbox(t.Context(), "sbx-1")
-	require.ErrorIs(t, err, catalog.ErrSandboxNotFound)
 	require.Len(t, p.routes, 1, "one entry per live sandbox while it runs")
 
-	// The stop must collect the entry even though nothing was written.
 	p.OnStopping(t.Context(), sbx)
 	require.Empty(t, p.routes)
 }
@@ -198,7 +179,7 @@ func TestPublisher_BuildSandboxIsSkipped(t *testing.T) {
 	t.Parallel()
 
 	c := newMemoryCatalog()
-	p := newPublisher(t, c, true)
+	p := newPublisher(t, c)
 	sbx := testSandbox(t, "build-1", "lc-1", sandboxtypes.SandboxTypeBuild)
 
 	p.OnInsert(t.Context(), sbx)
@@ -212,7 +193,7 @@ func TestPublisher_StoreErrorIsSwallowed(t *testing.T) {
 
 	c := newMemoryCatalog()
 	c.storeErr = errors.New("redis down")
-	p := newPublisher(t, c, true)
+	p := newPublisher(t, c)
 	sbx := testSandbox(t, "sbx-1", "lc-1", sandboxtypes.SandboxTypeSandbox)
 
 	p.OnInsert(t.Context(), sbx)
@@ -227,7 +208,7 @@ func TestPublisher_StopBeforeInsertLeavesTombstoneAndSkipsWrite(t *testing.T) {
 	t.Parallel()
 
 	c := newMemoryCatalog()
-	p := newPublisher(t, c, true)
+	p := newPublisher(t, c)
 
 	// A record owned by another writer for the same sandbox must survive a stop
 	// of a lifecycle this publisher never published.
@@ -253,7 +234,7 @@ func TestPublisher_StopDuringInFlightStoreWaitsAndDeletes(t *testing.T) {
 	c := newMemoryCatalog()
 	c.storeStarted = make(chan struct{})
 	c.storeRelease = make(chan struct{})
-	p := newPublisher(t, c, true)
+	p := newPublisher(t, c)
 	sbx := testSandbox(t, "sbx-1", "lc-1", sandboxtypes.SandboxTypeSandbox)
 
 	insertDone := make(chan struct{})
@@ -288,7 +269,7 @@ func TestPublisher_DeleteErrorForgetsLifecycle(t *testing.T) {
 	t.Parallel()
 
 	c := newMemoryCatalog()
-	p := newPublisher(t, c, true)
+	p := newPublisher(t, c)
 	sbx := testSandbox(t, "sbx-1", "lc-1", sandboxtypes.SandboxTypeSandbox)
 
 	p.OnInsert(t.Context(), sbx)
@@ -304,7 +285,7 @@ func TestPublisher_ViaSandboxMap(t *testing.T) {
 	t.Parallel()
 
 	c := newMemoryCatalog()
-	p := newPublisher(t, c, true)
+	p := newPublisher(t, c)
 	sandboxes := sandbox.NewSandboxesMap()
 	sandboxes.Subscribe(p)
 

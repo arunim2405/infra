@@ -133,19 +133,7 @@ func handlePausedSandbox(
 	return nodeIP, autoResumeSucceeded, nil
 }
 
-// selectCatalog picks the routing source per request: the orchestrator-owned
-// record when OrchestratorRoutingPrioritizedFlag is on, else the API-owned one.
-// The sandbox ID is passed as a LaunchDarkly context so the flag can be rolled
-// out progressively per sandbox.
-func selectCatalog(ctx context.Context, featureFlags *featureflags.Client, sandboxID string, apiCatalog, orchestratorCatalog catalog.SandboxesCatalog) catalog.SandboxesCatalog {
-	if orchestratorCatalog != nil && featureFlags.BoolFlag(ctx, featureflags.OrchestratorRoutingPrioritizedFlag, featureflags.SandboxContext(sandboxID)) {
-		return orchestratorCatalog
-	}
-
-	return apiCatalog
-}
-
-func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port, orchestratorProxyPort uint16, catalog catalog.SandboxesCatalog, orchestratorCatalog catalog.SandboxesCatalog, pausedSandboxResumer PausedSandboxResumer, featureFlagsClient *featureflags.Client) (*reverseproxy.Proxy, error) {
+func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port, orchestratorProxyPort uint16, catalog catalog.SandboxesCatalog, pausedSandboxResumer PausedSandboxResumer, featureFlagsClient *featureflags.Client) (*reverseproxy.Proxy, error) {
 	getTargetFromRequest := reverseproxy.GetTargetFromRequest()
 	proxy := reverseproxy.New(
 		port,
@@ -163,8 +151,7 @@ func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port
 
 			trafficAccessToken := r.Header.Get(proxygrpc.MetadataTrafficAccessToken)
 			envdAccessToken := r.Header.Get(proxygrpc.MetadataEnvdHTTPAccessToken)
-			routingSource := selectCatalog(ctx, featureFlagsClient, sandboxId, catalog, orchestratorCatalog)
-			nodeIP, err := catalogResolution(ctx, sandboxId, port, trafficAccessToken, envdAccessToken, routingSource, pausedSandboxResumer)
+			nodeIP, err := catalogResolution(ctx, sandboxId, port, trafficAccessToken, envdAccessToken, catalog, pausedSandboxResumer)
 			if err != nil {
 				if resumeDeniedErr, ok := errors.AsType[*reverseproxy.SandboxResumePermissionDeniedError](err); ok {
 					l.Warn(ctx, "sandbox resume denied", zap.Error(err))

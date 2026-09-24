@@ -687,12 +687,11 @@ func run(config cfg.Config, opts Options) (success bool) {
 		sbxEventsDeliveryTargets = append(sbxEventsDeliveryTargets, sbxEventsDeliveryRedis)
 	}
 
-	// Orchestrator-owned sandbox routing record (sandbox:routing:{id}), flag-gated inside the publisher.
+	// Orchestrator-owned sandbox routing record (sandbox:routing:{id}).
 	if redisClient != nil {
 		routingPublisher, err := routing.New(
 			tel.MeterProvider,
 			sandboxcatalog.NewRedisSandboxRoutingCatalog(redisClient),
-			featureFlags,
 			serviceInstanceID,
 			config.NodeIP,
 		)

@@ -378,7 +378,7 @@ func TestNewClientProxy_Construction(t *testing.T) {
 	c := catalog.NewRedisSandboxCatalog(redis_utils.SetupInstance(t))
 	ff := newFF(t)
 
-	p, err := NewClientProxy(noopmetric.NewMeterProvider(), "test-service", 0, 5007, c, nil, nil, ff)
+	p, err := NewClientProxy(noopmetric.NewMeterProvider(), "test-service", 0, 5007, c, nil, ff)
 	require.NoError(t, err)
 	require.NotNil(t, p)
 	require.EqualValues(t, 0, p.CurrentServerConnections())
@@ -395,47 +395,6 @@ func (c fixedCatalog) GetSandbox(context.Context, string) (*catalog.SandboxInfo,
 	return &catalog.SandboxInfo{OrchestratorIP: c.nodeIP}, nil
 }
 
-func TestSelectCatalog(t *testing.T) {
-	t.Parallel()
-
-	apiCatalog := fixedCatalog{nodeIP: "10.0.0.1"}
-	orchestratorCatalog := fixedCatalog{nodeIP: "10.0.0.2"}
-
-	newFFWithRoutingFlag := func(t *testing.T, enabled bool) *featureflags.Client {
-		t.Helper()
-
-		source := ldtestdata.DataSource()
-		source.Update(source.Flag(featureflags.OrchestratorRoutingPrioritizedFlag.Key()).VariationForAll(enabled))
-
-		ff, err := featureflags.NewClientWithDatasource(source)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = ff.Close(context.WithoutCancel(t.Context())) })
-
-		return ff
-	}
-
-	t.Run("flag off reads the api catalog", func(t *testing.T) {
-		t.Parallel()
-
-		got := selectCatalog(t.Context(), newFFWithRoutingFlag(t, false), "sbx-1", apiCatalog, orchestratorCatalog)
-		require.Equal(t, apiCatalog, got)
-	})
-
-	t.Run("flag on reads the orchestrator catalog", func(t *testing.T) {
-		t.Parallel()
-
-		got := selectCatalog(t.Context(), newFFWithRoutingFlag(t, true), "sbx-1", apiCatalog, orchestratorCatalog)
-		require.Equal(t, orchestratorCatalog, got)
-	})
-
-	t.Run("flag on without an orchestrator catalog falls back to the api catalog", func(t *testing.T) {
-		t.Parallel()
-
-		got := selectCatalog(t.Context(), newFFWithRoutingFlag(t, true), "sbx-1", apiCatalog, nil)
-		require.Equal(t, apiCatalog, got)
-	})
-}
-
 func TestNewClientProxy_ForwardsToConfiguredOrchestratorPort(t *testing.T) {
 	t.Parallel()
 
@@ -450,7 +409,7 @@ func TestNewClientProxy_ForwardsToConfiguredOrchestratorPort(t *testing.T) {
 	t.Cleanup(backend.Close)
 	address := backend.Listener.Addr().(*net.TCPAddr)
 	c := fixedCatalog{nodeIP: address.IP.String()}
-	p, err := NewClientProxy(noopmetric.NewMeterProvider(), "configured-port", 0, uint16(address.Port), c, nil, nil, newFF(t))
+	p, err := NewClientProxy(noopmetric.NewMeterProvider(), "configured-port", 0, uint16(address.Port), c, nil, newFF(t))
 	require.NoError(t, err)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://49983-sbx.e2b.app/commands", nil)
 	req.Header.Set("X-Access-Token", "sandbox-token")
@@ -525,7 +484,7 @@ func TestNewClientProxy_HandlerErrors(t *testing.T) {
 
 			c := catalog.NewRedisSandboxCatalog(redis_utils.SetupInstance(t))
 			ff := newFF(t)
-			p, err := NewClientProxy(noopmetric.NewMeterProvider(), "handler-errors-"+tt.name, uint16(i), 5007, c, nil, tt.resumer, ff)
+			p, err := NewClientProxy(noopmetric.NewMeterProvider(), "handler-errors-"+tt.name, uint16(i), 5007, c, tt.resumer, ff)
 			require.NoError(t, err)
 
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.url, nil)
@@ -549,7 +508,7 @@ func TestNewClientProxy_DuplicateMetricsRegistrationReturnsErrors(t *testing.T) 
 	// noop meter provider should not error; this is a sanity test that NewClientProxy
 	// works repeatedly for separate service names without leaking metric registrations.
 	for range 3 {
-		_, err := NewClientProxy(noopmetric.NewMeterProvider(), "service", 0, 5007, c, nil, nil, ff)
+		_, err := NewClientProxy(noopmetric.NewMeterProvider(), "service", 0, 5007, c, nil, ff)
 		require.NoError(t, err)
 	}
 }
@@ -561,7 +520,7 @@ func TestNewClientProxy_HasIdleTimeout(t *testing.T) {
 	c := catalog.NewRedisSandboxCatalog(redis_utils.SetupInstance(t))
 	ff := newFF(t)
 
-	p, err := NewClientProxy(noopmetric.NewMeterProvider(), "service-idle", 0, 5007, c, nil, nil, ff)
+	p, err := NewClientProxy(noopmetric.NewMeterProvider(), "service-idle", 0, 5007, c, nil, ff)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, p.IdleTimeout, idleTimeout)
 	require.Less(t, p.IdleTimeout, 2*idleTimeout)
@@ -574,7 +533,7 @@ func TestNewClientProxy_PoolAccessors(t *testing.T) {
 	c := catalog.NewRedisSandboxCatalog(redis_utils.SetupInstance(t))
 	ff := newFF(t)
 
-	p, err := NewClientProxy(noopmetric.NewMeterProvider(), "service-pool", 0, 5007, c, nil, nil, ff)
+	p, err := NewClientProxy(noopmetric.NewMeterProvider(), "service-pool", 0, 5007, c, nil, ff)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, p.CurrentPoolSize(), 0)
 
