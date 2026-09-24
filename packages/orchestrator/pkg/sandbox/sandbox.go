@@ -72,6 +72,7 @@ var (
 	guestSyncDurationHistogram    = utils.Must(telemetry.GetHistogram(meter, telemetry.GuestSyncDurationHistogramName))
 	fsQuiescedPauseCounter        = utils.Must(telemetry.GetCounter(meter, telemetry.SandboxPauseFsQuiescedCounterName))
 	resumeWPModeCounter           = utils.Must(telemetry.GetCounter(meter, telemetry.SandboxResumeWPModeCounterName))
+	lifecycleUnstoppedCounter     = utils.Must(telemetry.GetCounter(meter, telemetry.SandboxLifecycleUnstoppedCounterName))
 
 	processMemoryDurationHistogram = utils.Must(telemetry.GetHistogram(meter, telemetry.SnapshotProcessMemoryDurationName))
 	processRootfsDurationHistogram = utils.Must(telemetry.GetHistogram(meter, telemetry.SnapshotProcessRootfsDurationName))
@@ -989,7 +990,7 @@ func (f *Factory) CreateSandbox(
 	}
 
 	f.Sandboxes.AssignNetwork(ctx, sbx)
-	f.Sandboxes.reclaimLiveEntryOnCleanup(ctx, cleanup, runtime.SandboxID, sbx.LifecycleID)
+	f.Sandboxes.reclaimLiveEntryOnCleanup(ctx, cleanup, runtime.SandboxID, sbx.LifecycleID, runtime.SandboxType)
 
 	// Do not move this call: it must run after AssignNetwork above and
 	// before fcHandle.Create below, so OnNetworkAssign always runs before
@@ -1606,7 +1607,7 @@ func (f *Factory) ResumeSandbox(
 	// during the resume (e.g. for TCP firewall lookups). On failure the deferred cleanup
 	// will remove it.
 	f.Sandboxes.AssignNetwork(ctx, sbx)
-	f.Sandboxes.reclaimLiveEntryOnCleanup(ctx, cleanup, runtime.SandboxID, sbx.LifecycleID)
+	f.Sandboxes.reclaimLiveEntryOnCleanup(ctx, cleanup, runtime.SandboxID, sbx.LifecycleID, runtime.SandboxType)
 
 	reason := NetworkAssignReasonResume
 	if ropts.skipLiveRegistration {

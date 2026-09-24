@@ -83,6 +83,19 @@ const (
 	// population for the offline envd upgrade built on top of this flag.
 	SandboxPauseFsQuiescedCounterName CounterType = "orchestrator.sandbox.pause.fs_quiesced"
 
+	// SandboxLifecycleUnstoppedCounterName counts sandbox lifecycles whose live-map
+	// entry was reclaimed by the teardown cleanup chain rather than by an operation:
+	// nobody marked the lifecycle stopping before the chain ran. Three teardowns
+	// reach it — a guest exit or Firecracker death with no API teardown, a build
+	// layer's bare deferred close, and an in-place checkpoint whose resume failed
+	// and tore the sandbox down itself. Split by sandbox_type rather than filtered
+	// to sandbox, because every successful build layer takes the same branch and
+	// would otherwise dominate the bucket; dropping builds instead would make "the
+	// build tree stopped reaching this" indistinguishable from "the build tree is
+	// fine". It is a lower bound, never a total: the live map is in-process, so a
+	// lifecycle spanning an orchestrator restart is never counted.
+	SandboxLifecycleUnstoppedCounterName CounterType = "orchestrator.sandbox.lifecycle.unstopped"
+
 	// SandboxResumeWPModeCounterName counts sandbox resumes by the write-protect
 	// tracking mode the resume chose (mode=sync|async, the use-sync-wp flag
 	// decision). This is the denominator for every sync-WP burn-in signal:
@@ -605,6 +618,7 @@ var counterDesc = map[CounterType]string{
 	OrchestratorFPRResumeCounterName:             "Free-page-reporting resumes after a CoW window, labeled by outcome (inline, retry, fenced, fc_exited, abandoned)",
 	OrchestratorSnapshotUploadFailedCounterName:  "Number of pause-snapshot uploads that never landed durably",
 	SandboxPauseFsQuiescedCounterName:            "Filesystem-only pauses by whether the rootfs was frozen (quiesced) vs sync fallback",
+	SandboxLifecycleUnstoppedCounterName:         "Sandbox lifecycles whose live-map entry the teardown chain reclaimed because no operation marked them stopping, by sandbox type",
 	SandboxResumeWPModeCounterName:               "Sandbox resumes by write-protect tracking mode (sync|async)",
 	EnvdDefaultsApplied:                          "Memory resumes by where the envd default user the orchestrator sent was derived from, and sandbox type",
 	EnvdDefaultsMismatch:                         "/init responses where envd's effective defaults differ from what was sent, by field",
@@ -668,6 +682,7 @@ var counterUnits = map[CounterType]string{
 	OrchestratorFPRResumeCounterName:             "{resume}",
 	OrchestratorSnapshotUploadFailedCounterName:  "{snapshot}",
 	SandboxPauseFsQuiescedCounterName:            "{snapshot}",
+	SandboxLifecycleUnstoppedCounterName:         "{sandbox}",
 	SandboxResumeWPModeCounterName:               "{resume}",
 	EnvdDefaultsApplied:                          "{resume}",
 	EnvdDefaultsMismatch:                         "{mismatch}",

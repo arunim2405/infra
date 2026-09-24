@@ -4,16 +4,21 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
 	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
 func TestMapMarkRunningTracksLifecycle(t *testing.T) {
@@ -541,6 +546,10 @@ func TestMapMarkRunningIdempotentForSameLifecycle(t *testing.T) {
 
 func TestSandboxCloseDoesNotRemoveNewerLiveLifecycle(t *testing.T) {
 	t.Parallel()
+	// The owner returns false here, so nothing is counted — but the rule is about
+	// registering it, not about which arm the registration happens to take, so that
+	// this stays true however the fixture is edited later.
+	serializeUnstoppedCounter(t)
 
 	sandboxes := NewSandboxesMap()
 	oldSbx := testMapSandbox(t, "lifecycle-old")
@@ -578,6 +587,118 @@ func (r *stoppingRecorder) OnStopping(context.Context, *Sandbox) {
 	*r.events = append(*r.events, "reclaim")
 }
 
+// unstoppedCounterMu serializes every test that moves lifecycleUnstoppedCounter.
+//
+// The counter carries one attribute, sandbox_type, and deliberately nothing that
+// identifies a run — that is what keeps its series count independent of traffic. So
+// a test has nothing to filter its own increments by, and the reader installed in
+// TestMain is process-wide and cumulative across the whole binary. The only sound
+// reading is a delta, and a delta is sound only while every test that moves the
+// instrument holds this lock. Four tests here predate the counter and register the
+// owner: two move it, and two sit on a branch that does not currently fire — which
+// is a property of their fixtures, not of their subjects, so it can change without
+// anyone noticing. TestEveryOwnedCleanupTestSerializesTheCounter keeps all four in.
+var unstoppedCounterMu sync.Mutex
+
+// serializeUnstoppedCounter claims the counter for this test until it returns.
+func serializeUnstoppedCounter(t *testing.T) {
+	t.Helper()
+
+	unstoppedCounterMu.Lock()
+	t.Cleanup(unstoppedCounterMu.Unlock)
+}
+
+// unstoppedCounts is the counter's current value per sandbox_type. Absent types
+// read as zero, so a caller can subtract two of these without checking presence.
+func unstoppedCounts(t *testing.T) map[string]int64 {
+	t.Helper()
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, testMetricReader.Collect(t.Context(), &rm))
+
+	out := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != string(telemetry.SandboxLifecycleUnstoppedCounterName) {
+				continue
+			}
+
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.Truef(t, ok, "%s is not an int64 sum", m.Name)
+
+			for _, dp := range sum.DataPoints {
+				v, ok := dp.Attributes.Value(attribute.Key("sandbox_type"))
+				require.True(t, ok, "unstopped datapoint without a sandbox_type")
+				out[v.AsString()] += dp.Value
+			}
+		}
+	}
+
+	return out
+}
+
+// unstoppedDelta is what the counter moved by, per sandbox_type, since before.
+func unstoppedDelta(t *testing.T, before map[string]int64) map[string]int64 {
+	t.Helper()
+
+	after := unstoppedCounts(t)
+	delta := map[string]int64{}
+	for _, sbxType := range []string{
+		string(sandboxtypes.SandboxTypeSandbox),
+		string(sandboxtypes.SandboxTypeBuild),
+	} {
+		delta[sbxType] = after[sbxType] - before[sbxType]
+	}
+
+	require.Subsetf(t, []string{
+		string(sandboxtypes.SandboxTypeSandbox),
+		string(sandboxtypes.SandboxTypeBuild),
+	}, keysOf(after), "the counter grew a sandbox_type value outside the closed set")
+
+	return delta
+}
+
+func keysOf(m map[string]int64) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+
+	return out
+}
+
+// unstoppedLogs counts the traceable lines logged for one sandbox id. The observer
+// is process-wide too, so the id is what separates one test's line from another's.
+func unstoppedLogs(sandboxID string) int {
+	n := 0
+	for _, e := range testLogObserver.FilterMessage("sandbox lifecycle ended with no explicit stop").All() {
+		for _, f := range e.Context {
+			if f.Key == "sandbox.id" && f.String == sandboxID {
+				n++
+			}
+		}
+	}
+
+	return n
+}
+
+// testSandboxSeq numbers the sandboxes these tests build so each one's id is unique
+// to its invocation. t.Name() would not do: it repeats under -count, and the log
+// observer accumulates for the whole binary.
+var testSandboxSeq atomic.Uint64
+
+// testTypedMapSandbox is testMapSandbox with a sandbox id unique to this call and an
+// explicit sandbox type — the two things the counter and its log line report.
+func testTypedMapSandbox(t *testing.T, lifecycleID string, sandboxType sandboxtypes.SandboxType) *Sandbox {
+	t.Helper()
+
+	sbx := testMapSandbox(t, lifecycleID)
+	sbx.Runtime.SandboxID = fmt.Sprintf("sbx-%d", testSandboxSeq.Add(1))
+	sbx.Runtime.SandboxType = sandboxType
+
+	return sbx
+}
+
 // attachOwnedCleanup gives sbx the cleanup chain a factory would build: the
 // registrar's callback, and nothing else. Both factories register it at one
 // fixed point, so a fixture without it asserts a behaviour no real sandbox has.
@@ -586,18 +707,21 @@ func attachOwnedCleanup(t *testing.T, sandboxes *Map, sbx *Sandbox) {
 
 	sbx.cleanup = NewCleanup()
 	sbx.sandboxes = sandboxes
-	sandboxes.reclaimLiveEntryOnCleanup(t.Context(), sbx.cleanup, sbx.Runtime.SandboxID, sbx.LifecycleID)
+	sandboxes.reclaimLiveEntryOnCleanup(t.Context(), sbx.cleanup, sbx.Runtime.SandboxID, sbx.LifecycleID, sbx.Runtime.SandboxType)
 }
 
-// The cleanup chain owns the reclamation, and owns it at one point: after the
-// steps registered before the registrar and before those registered after it.
-// An end-state assertion cannot see this — the entry is gone either way — so the
-// markers and the event log are the test.
+// The cleanup chain owns the reclamation, and owns it at one point. The chain runs
+// backward, so in RUN order the reclaim falls after the steps registered after the
+// registrar and before those registered before it. An end-state assertion cannot
+// see this — the entry is gone either way — so the markers and the event log are
+// the test.
 func TestSandboxCloseReclaimsLiveEntryInTheCleanupChain(t *testing.T) {
 	t.Parallel()
+	serializeUnstoppedCounter(t)
 
 	sandboxes := NewSandboxesMap()
-	sbx := testMapSandbox(t, "lifecycle-1")
+	sbx := testTypedMapSandbox(t, "lifecycle-1", sandboxtypes.SandboxTypeSandbox)
+	before := unstoppedCounts(t)
 
 	var (
 		mu     sync.Mutex
@@ -619,7 +743,7 @@ func TestSandboxCloseReclaimsLiveEntryInTheCleanupChain(t *testing.T) {
 	sbx.cleanup = NewCleanup()
 	sbx.sandboxes = sandboxes
 	sbx.cleanup.Add(t.Context(), mark("late"))
-	sandboxes.reclaimLiveEntryOnCleanup(t.Context(), sbx.cleanup, sbx.Runtime.SandboxID, sbx.LifecycleID)
+	sandboxes.reclaimLiveEntryOnCleanup(t.Context(), sbx.cleanup, sbx.Runtime.SandboxID, sbx.LifecycleID, sbx.Runtime.SandboxType)
 	sbx.cleanup.Add(t.Context(), mark("early"))
 
 	require.NoError(t, sandboxes.MarkRunning(t.Context(), sbx))
@@ -628,17 +752,30 @@ func TestSandboxCloseReclaimsLiveEntryInTheCleanupChain(t *testing.T) {
 	require.Empty(t, sandboxes.Items())
 	require.Equal(t, []string{"early", "reclaim", "late"}, events,
 		"the chain must reclaim the entry exactly once, between the steps either side of the registrar")
+
+	// The reclamation and its report are the same branch, so the counter moving by
+	// one is the same claim as the "reclaim" marker above — read from the metric
+	// rather than from the callback, which is where a dashboard reads it.
+	assert.Equal(t, map[string]int64{
+		string(sandboxtypes.SandboxTypeSandbox): 1,
+		string(sandboxtypes.SandboxTypeBuild):   0,
+	}, unstoppedDelta(t, before))
+
+	assert.Equal(t, 1, unstoppedLogs(sbx.Runtime.SandboxID),
+		"one customer increment must be traceable to the sandbox that caused it")
 }
 
-// An operation-initiated stop — delete, pause, checkpoint — reclaims the entry
-// before the chain runs. The chain's callback must then do nothing at all: no
-// second OnStopping for subscribers to act on twice.
+// An operation-initiated stop — delete, pause, a checkpoint that resumes fresh —
+// reclaims the entry before the chain runs. The chain's callback must then do
+// nothing at all: no second OnStopping for subscribers to act on twice.
 func TestSandboxCloseDoesNotReclaimAnEntryAnOperationAlreadyTook(t *testing.T) {
 	t.Parallel()
+	serializeUnstoppedCounter(t)
 
 	sandboxes := NewSandboxesMap()
-	sbx := testMapSandbox(t, "lifecycle-1")
+	sbx := testTypedMapSandbox(t, "lifecycle-1", sandboxtypes.SandboxTypeSandbox)
 	attachOwnedCleanup(t, sandboxes, sbx)
+	before := unstoppedCounts(t)
 
 	var (
 		mu     sync.Mutex
@@ -653,17 +790,33 @@ func TestSandboxCloseDoesNotReclaimAnEntryAnOperationAlreadyTook(t *testing.T) {
 
 	require.Equal(t, []string{"reclaim"}, events,
 		"the chain's callback must not reclaim an entry an operation already took")
+
+	// The load-bearing case for the whole metric: this is what makes the series mean
+	// "nobody stopped this lifecycle" rather than "a sandbox ended". Delete, pause
+	// and a checkpoint that resumes fresh all mark the entry stopping before the
+	// chain runs and must land here, uncounted. An in-place checkpoint is the one
+	// that does not, and it is counted — see the test below.
+	assert.Equal(t, map[string]int64{
+		string(sandboxtypes.SandboxTypeSandbox): 0,
+		string(sandboxtypes.SandboxTypeBuild):   0,
+	}, unstoppedDelta(t, before))
+
+	assert.Zero(t, unstoppedLogs(sbx.Runtime.SandboxID),
+		"an operation-initiated stop must not log the unstopped line either")
 }
 
-// Two drivers can call Close for one lifecycle: the lifecycle goroutine and the
-// start rollback. Cleanup.Run is once-guarded, so they reclaim once between them
-// and neither returns before the reclamation has completed.
+// Several drivers can call Close for one lifecycle — the lifecycle goroutine, the
+// start rollback, the build tree's deferred close alongside Shutdown, and Pause's
+// own in-place teardown. Cleanup.Run is once-guarded, so they reclaim once between
+// them and none returns before the reclamation has completed.
 func TestSandboxCloseConcurrentClosesReclaimOnce(t *testing.T) {
 	t.Parallel()
+	serializeUnstoppedCounter(t)
 
 	sandboxes := NewSandboxesMap()
-	sbx := testMapSandbox(t, "lifecycle-1")
+	sbx := testTypedMapSandbox(t, "lifecycle-1", sandboxtypes.SandboxTypeSandbox)
 	attachOwnedCleanup(t, sandboxes, sbx)
+	before := unstoppedCounts(t)
 
 	var (
 		mu     sync.Mutex
@@ -691,6 +844,151 @@ func TestSandboxCloseConcurrentClosesReclaimOnce(t *testing.T) {
 	require.Equal(t, []string{"reclaim"}, events)
 	require.Empty(t, sandboxes.Items())
 	require.Empty(t, sandboxes.LifecycleItems())
+
+	assert.Equal(t, map[string]int64{
+		string(sandboxtypes.SandboxTypeSandbox): 1,
+		string(sandboxtypes.SandboxTypeBuild):   0,
+	}, unstoppedDelta(t, before))
+}
+
+// Two sequential closes happen for real on the build provisioning path, which
+// defers a Close and then calls Shutdown, whose own Close runs first. Cleanup.Run
+// is once-guarded, so the second Close never re-enters the chain at all and the
+// counter cannot double — this pins that guard, not anything about the counter's
+// own arithmetic. The concurrent case above is the one with an interleaving.
+func TestSandboxCloseTwiceCountsOnce(t *testing.T) {
+	t.Parallel()
+	serializeUnstoppedCounter(t)
+
+	sandboxes := NewSandboxesMap()
+	sbx := testTypedMapSandbox(t, "lifecycle-1", sandboxtypes.SandboxTypeSandbox)
+	attachOwnedCleanup(t, sandboxes, sbx)
+	before := unstoppedCounts(t)
+
+	require.NoError(t, sandboxes.MarkRunning(t.Context(), sbx))
+	require.NoError(t, sbx.Close(t.Context()))
+	require.NoError(t, sbx.Close(t.Context()), "a second Close must stay successful")
+
+	assert.Equal(t, map[string]int64{
+		string(sandboxtypes.SandboxTypeSandbox): 1,
+		string(sandboxtypes.SandboxTypeBuild):   0,
+	}, unstoppedDelta(t, before))
+	assert.Equal(t, 1, unstoppedLogs(sbx.Runtime.SandboxID))
+}
+
+// A build layer boot ends exactly like a crash does — nothing in the build tree
+// marks a sandbox stopping, and every successful layer reaches the branch. The
+// population has to be visible, or a build tree that stopped reaching it would
+// read the same as a healthy one; and it has to be visible in the metric only,
+// because at one log line per layer it would bury the customer lines it shares a
+// message with.
+func TestSandboxCloseCountsABuildLifecycleWithoutLoggingIt(t *testing.T) {
+	t.Parallel()
+	serializeUnstoppedCounter(t)
+
+	sandboxes := NewSandboxesMap()
+	sbx := testTypedMapSandbox(t, "lifecycle-1", sandboxtypes.SandboxTypeBuild)
+	attachOwnedCleanup(t, sandboxes, sbx)
+	before := unstoppedCounts(t)
+
+	require.NoError(t, sandboxes.MarkRunning(t.Context(), sbx))
+	require.NoError(t, sbx.Close(t.Context()))
+
+	assert.Equal(t, map[string]int64{
+		string(sandboxtypes.SandboxTypeSandbox): 0,
+		string(sandboxtypes.SandboxTypeBuild):   1,
+	}, unstoppedDelta(t, before))
+
+	assert.Zero(t, unstoppedLogs(sbx.Runtime.SandboxID),
+		"the build population is observable in the metric, not in the log")
+}
+
+// SandboxType's zero value is reachable: the resume-build and benchmark harnesses
+// build RuntimeMetadata without it. String() maps it to "sandbox", and the label
+// and the log gate read that one normalized local — so an unset type joins the
+// customer series and is logged like one, rather than opening a third series or
+// being counted as a customer and refused by the gate.
+func TestSandboxCloseCountsAnUnsetTypeAsACustomerSandbox(t *testing.T) {
+	t.Parallel()
+	serializeUnstoppedCounter(t)
+
+	sandboxes := NewSandboxesMap()
+	sbx := testTypedMapSandbox(t, "lifecycle-1", "")
+	attachOwnedCleanup(t, sandboxes, sbx)
+	before := unstoppedCounts(t)
+
+	require.NoError(t, sandboxes.MarkRunning(t.Context(), sbx))
+	require.NoError(t, sbx.Close(t.Context()))
+
+	assert.Equal(t, map[string]int64{
+		string(sandboxtypes.SandboxTypeSandbox): 1,
+		string(sandboxtypes.SandboxTypeBuild):   0,
+	}, unstoppedDelta(t, before))
+
+	assert.Equal(t, 1, unstoppedLogs(sbx.Runtime.SandboxID),
+		"the log gate and the attribute must agree on an unset type")
+}
+
+// An in-place checkpoint never marks the entry stopping — that is the point of it
+// — so when its resume fails, Sandbox.Pause tears the sandbox down with the entry
+// still live, having already recorded why. That teardown is orchestrator-chosen
+// and still lands in the customer series, because the branch is about which
+// mechanism reclaimed the entry and not about intent. Pinning it here is what
+// stops the series being read as "guest deaths": a recorded stop reason does not
+// take a lifecycle out of it.
+func TestSandboxCloseCountsAnOrchestratorTeardownThatSkippedTheMark(t *testing.T) {
+	t.Parallel()
+	serializeUnstoppedCounter(t)
+
+	sandboxes := NewSandboxesMap()
+	sbx := testTypedMapSandbox(t, "lifecycle-1", sandboxtypes.SandboxTypeSandbox)
+	attachOwnedCleanup(t, sandboxes, sbx)
+	before := unstoppedCounts(t)
+
+	require.NoError(t, sandboxes.MarkRunning(t.Context(), sbx))
+	sbx.SetStopReason(StopReasonKilled)
+	require.NoError(t, sbx.Close(t.Context()))
+
+	assert.Equal(t, map[string]int64{
+		string(sandboxtypes.SandboxTypeSandbox): 1,
+		string(sandboxtypes.SandboxTypeBuild):   0,
+	}, unstoppedDelta(t, before))
+
+	// The line names the sandbox, which is where an investigation starts; it does
+	// not say which of the three teardowns this was, and neither does the counter.
+	assert.Equal(t, 1, unstoppedLogs(sbx.Runtime.SandboxID),
+		"an orchestrator-chosen teardown is logged like any other customer lifecycle")
+}
+
+// A lifecycle that never became live has no entry to reclaim: the reboot path
+// defers its mark, and any construction failing before MarkRunning never made
+// one. Nothing is counted, correctly — and Close returns exactly what it returns
+// with an entry present, so the counter cannot turn a successful teardown into a
+// failed one.
+func TestSandboxCloseWithoutALiveEntryCountsNothing(t *testing.T) {
+	t.Parallel()
+	serializeUnstoppedCounter(t)
+
+	sandboxes := NewSandboxesMap()
+	sbx := testTypedMapSandbox(t, "lifecycle-1", sandboxtypes.SandboxTypeSandbox)
+	attachOwnedCleanup(t, sandboxes, sbx)
+	before := unstoppedCounts(t)
+
+	// No MarkRunning.
+	require.NoError(t, sbx.Close(t.Context()), "Close must succeed with no live entry")
+
+	assert.Equal(t, map[string]int64{
+		string(sandboxtypes.SandboxTypeSandbox): 0,
+		string(sandboxtypes.SandboxTypeBuild):   0,
+	}, unstoppedDelta(t, before))
+	assert.Zero(t, unstoppedLogs(sbx.Runtime.SandboxID))
+
+	// The same Close against a live entry: the counted branch returns the same
+	// value, so no error was introduced on either side of the boolean.
+	live := testTypedMapSandbox(t, "lifecycle-2", sandboxtypes.SandboxTypeSandbox)
+	attachOwnedCleanup(t, sandboxes, live)
+	require.NoError(t, sandboxes.MarkRunning(t.Context(), live))
+	require.NoError(t, live.Close(t.Context()), "Close must succeed with a live entry too")
 }
 
 func testMapSandbox(t *testing.T, lifecycleID string) *Sandbox {

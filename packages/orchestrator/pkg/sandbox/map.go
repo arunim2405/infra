@@ -9,7 +9,12 @@ import (
 	"net"
 	"sync"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.uber.org/zap"
+
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
 )
 
@@ -282,12 +287,52 @@ func (m *Map) MarkStopping(ctx context.Context, sandboxID, lifecycleID string) b
 // host-IP findability: GetByHostPort reads the network index, which the slot
 // return clears asynchronously and well after this chain ends. Do not move this
 // call.
-func (m *Map) reclaimLiveEntryOnCleanup(ctx context.Context, cleanup *Cleanup, sandboxID, lifecycleID string) {
+//
+// sandboxType is carried only so the counter below can report it; nothing here
+// branches on it except the log gate, which reads the same normalized local.
+func (m *Map) reclaimLiveEntryOnCleanup(ctx context.Context, cleanup *Cleanup, sandboxID, lifecycleID string, sandboxType sandboxtypes.SandboxType) {
 	cleanup.Add(ctx, func(ctx context.Context) error {
-		// false is the normal outcome: an operation-initiated stop (delete, pause,
-		// checkpoint) reclaims the entry before the chain runs, and a lifecycle that
+		// false is the normal outcome: delete, pause and a checkpoint that resumes
+		// fresh all reclaim the entry before the chain runs, and a lifecycle that
 		// never became live has no entry to reclaim.
-		m.MarkStopping(ctx, sandboxID, lifecycleID)
+		if !m.MarkStopping(ctx, sandboxID, lifecycleID) {
+			return nil
+		}
+
+		// true means this lifecycle reached teardown with nobody having marked it
+		// stopping. Three teardowns get here: a guest exit or Firecracker death
+		// with no API teardown, a build layer's bare deferred close, and an
+		// in-place checkpoint whose resume failed and tore the sandbox down itself
+		// (Sandbox.Pause, under maintainSandbox). The last is orchestrator-chosen
+		// and still counted — the entry was live and no operation reclaimed it —
+		// so a rise here is not necessarily a rise in guest deaths.
+		//
+		// Firecracker has already exited by now on every path, whether or not the
+		// caller waited: the chain's priority callback stops the sandbox first, and
+		// doStop waits on the process exit. So this is a post-mortem observation,
+		// not a race against a live guest.
+		//
+		// String() maps the zero value to "sandbox", so an unset type joins the
+		// customer series rather than opening a third, unnamed one. The attribute
+		// and the log gate below read this one local so they cannot disagree about
+		// which population a lifecycle is in.
+		sbxType := sandboxType.String()
+
+		lifecycleUnstoppedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("sandbox_type", sbxType)))
+
+		// The counter covers both populations; the log covers only customers. Every
+		// successful build layer reaches this branch, so a line per build would
+		// report the expected outcome of a healthy build at build-boot rate and
+		// bury the customer lines it shares a message with. For customers the
+		// individual occurrence — not the rate — is the unit of investigation,
+		// which is what the line is for.
+		if sbxType == string(sandboxtypes.SandboxTypeSandbox) {
+			logger.L().Info(ctx, "sandbox lifecycle ended with no explicit stop",
+				logger.WithSandboxID(sandboxID),
+				logger.WithLifecycleID(lifecycleID),
+				zap.String("sandbox_type", sbxType),
+			)
+		}
 
 		return nil
 	})
