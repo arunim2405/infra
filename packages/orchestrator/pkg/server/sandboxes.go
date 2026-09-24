@@ -872,16 +872,7 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 		return nil, status.Error(codes.NotFound, "sandbox not found")
 	}
 
-	ctx = featureflags.AddToContext(
-		ctx,
-		ldcontext.NewBuilder(in.GetSandboxId()).
-			Kind(featureflags.SandboxKind).
-			SetString(featureflags.SandboxTemplateAttribute, sbx.Runtime.TemplateID).
-			SetString(featureflags.SandboxKernelVersionAttribute, sbx.Config.FirecrackerConfig.KernelVersion).
-			SetString(featureflags.SandboxFirecrackerVersionAttribute, sbx.Config.FirecrackerConfig.FirecrackerVersion).
-			SetString(featureflags.SandboxEnvdVersionAttribute, sbx.Config.Envd.Version).
-			Build(),
-	)
+	ctx = featureflags.AddToContext(ctx, sandboxFlagContexts(sbx)...)
 
 	childSpan.SetAttributes(
 		telemetry.WithTeamID(sbx.Runtime.TeamID),
@@ -1017,6 +1008,22 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 	}, nil
 }
 
+// sandboxFlagContexts returns the LaunchDarkly contexts for flag evaluations
+// made on behalf of a sandbox already running on this node: the sandbox and
+// its team, the same two kinds Create evaluates with.
+func sandboxFlagContexts(sbx *sandbox.Sandbox) []ldcontext.Context {
+	return []ldcontext.Context{
+		ldcontext.NewBuilder(sbx.Runtime.SandboxID).
+			Kind(featureflags.SandboxKind).
+			SetString(featureflags.SandboxTemplateAttribute, sbx.Runtime.TemplateID).
+			SetString(featureflags.SandboxKernelVersionAttribute, sbx.Config.FirecrackerConfig.KernelVersion).
+			SetString(featureflags.SandboxFirecrackerVersionAttribute, sbx.Config.FirecrackerConfig.FirecrackerVersion).
+			SetString(featureflags.SandboxEnvdVersionAttribute, sbx.Config.Envd.Version).
+			Build(),
+		featureflags.TeamContext(sbx.Runtime.TeamID),
+	}
+}
+
 func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpointRequest) (*orchestrator.SandboxCheckpointResponse, error) {
 	releaseWork := s.info.TrackWork()
 	defer releaseWork()
@@ -1036,16 +1043,7 @@ func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpo
 		return nil, status.Errorf(codes.NotFound, "sandbox '%s' not found", in.GetSandboxId())
 	}
 
-	ctx = featureflags.AddToContext(
-		ctx,
-		ldcontext.NewBuilder(in.GetSandboxId()).
-			Kind(featureflags.SandboxKind).
-			SetString(featureflags.SandboxTemplateAttribute, sbx.Runtime.TemplateID).
-			SetString(featureflags.SandboxKernelVersionAttribute, sbx.Config.FirecrackerConfig.KernelVersion).
-			SetString(featureflags.SandboxFirecrackerVersionAttribute, sbx.Config.FirecrackerConfig.FirecrackerVersion).
-			SetString(featureflags.SandboxEnvdVersionAttribute, sbx.Config.Envd.Version).
-			Build(),
-	)
+	ctx = featureflags.AddToContext(ctx, sandboxFlagContexts(sbx)...)
 
 	childSpan.SetAttributes(
 		telemetry.WithTeamID(sbx.Runtime.TeamID),
