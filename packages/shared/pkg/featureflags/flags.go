@@ -382,6 +382,17 @@ var (
 	// supersedes V4HeaderForUncompressedFlag for uncompressed uploads.
 	HeaderV5WriteFlag = NewBoolFlag("header-v5-write", false)
 
+	// SnapshotCacheAncestorStorageFallbackFlag lets a snapshot upload resolve an
+	// ancestor whose upload future fired successfully but whose template-cache
+	// entry is gone, instead of failing the upload. An entry the child already
+	// carries is kept; otherwise it is healed from the ancestor's stored header
+	// without LoadHeader's backfill, so the child gets the ancestor's entry only
+	// as that header carries it, or the empty entry a header older than the
+	// Builds map always gets. Evaluated at each wait that reaches that case.
+	// It changes bytes written into headers that reach storage, and turning it
+	// off does not rewrite headers written while it was on.
+	SnapshotCacheAncestorStorageFallbackFlag = NewBoolFlag("snapshot-cache-ancestor-storage-fallback", false)
+
 	// ResumeOriginNodeRemapFlag enables repointing a snapshot's origin_node_id to
 	// the fallback node a resume timed out on. The node's local cache is warming
 	// from the in-progress snapshot pull, so pinning the retry to it avoids

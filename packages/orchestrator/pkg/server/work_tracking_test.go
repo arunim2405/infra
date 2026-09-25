@@ -106,7 +106,7 @@ func TestUploadSnapshotAsyncTracksWorkThroughCompletion(t *testing.T) {
 						return nil
 					})
 
-				uploads := sandbox.NewUploads(nil, store, nil, nil)
+				uploads := sandbox.NewUploads(nil, store, nil, nil, nil)
 				defer uploads.Stop()
 				upload, err := sandbox.NewUpload(ctx, uploads, &sandbox.Snapshot{
 					BuildID:            buildID,

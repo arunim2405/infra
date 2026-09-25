@@ -356,7 +356,7 @@ func doBuild(
 	// their parents' header finalization. Redis is nil (CLI is single-host —
 	// no cross-orch signaling needed); local same-orch coordination via
 	// futures is what matters here.
-	uploads := sandbox.NewUploads(templateCache, persistenceTemplate, peerclient.NopResolver(), nil)
+	uploads := sandbox.NewUploads(templateCache, persistenceTemplate, peerclient.NopResolver(), nil, featureFlags)
 	defer uploads.Stop()
 
 	builder := build.NewBuilder(

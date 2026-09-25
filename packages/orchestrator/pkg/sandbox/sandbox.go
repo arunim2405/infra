@@ -73,6 +73,7 @@ var (
 	fsQuiescedPauseCounter        = utils.Must(telemetry.GetCounter(meter, telemetry.SandboxPauseFsQuiescedCounterName))
 	resumeWPModeCounter           = utils.Must(telemetry.GetCounter(meter, telemetry.SandboxResumeWPModeCounterName))
 	lifecycleUnstoppedCounter     = utils.Must(telemetry.GetCounter(meter, telemetry.SandboxLifecycleUnstoppedCounterName))
+	ancestorResolutionsCounter    = utils.Must(telemetry.GetCounter(meter, telemetry.OrchestratorTemplateCacheAncestorResolutionsCounterName))
 
 	processMemoryDurationHistogram = utils.Must(telemetry.GetHistogram(meter, telemetry.SnapshotProcessMemoryDurationName))
 	processRootfsDurationHistogram = utils.Must(telemetry.GetHistogram(meter, telemetry.SnapshotProcessRootfsDurationName))

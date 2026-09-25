@@ -2,12 +2,15 @@ package header
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"io"
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
@@ -1215,4 +1218,58 @@ func TestDeserialize_LegacyGapKeepsExplicitLengths(t *testing.T) {
 			require.Error(t, got.Mapping.Validate(4*bs, PageSize))
 		})
 	}
+}
+
+// storedHeaderProvider serves data as the blob at path, for as many opens as
+// the test makes.
+func storedHeaderProvider(t *testing.T, path string, data []byte) storage.StorageProvider {
+	t.Helper()
+
+	provider := storage.NewMockStorageProvider(t)
+	provider.EXPECT().OpenBlob(mock.Anything, path).RunAndReturn(func(context.Context, string) (storage.Blob, error) {
+		blob := storage.NewMockBlob(t)
+		blob.EXPECT().WriteTo(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, w io.Writer) (int64, error) {
+			return io.Copy(w, bytes.NewReader(data))
+		})
+
+		return blob, nil
+	})
+
+	return provider
+}
+
+// LoadStoredHeader returns the Builds map exactly as serialized; LoadHeader,
+// over the same bytes, still backfills the header's own missing entry. The
+// fixture is the shape runV3 writes under a V4 parent: a V4 header whose
+// mapping references its own build and whose Builds map has no entry for it.
+func TestLoadStoredHeader_SkipsOwnBuildBackfill(t *testing.T) {
+	t.Parallel()
+
+	selfID := uuid.New()
+	parentID := uuid.New()
+	parentBD := BuildData{Size: 4096}
+
+	h, err := NewHeader(&Metadata{
+		Version: MetadataVersionV4, BlockSize: 4096, Size: 8192,
+		BuildId: selfID, BaseBuildId: parentID,
+	}, []BuildMap{
+		{Offset: 0, Length: 4096, BuildId: selfID},
+		{Offset: 4096, Length: 4096, BuildId: parentID},
+	})
+	require.NoError(t, err)
+	h.Builds = map[uuid.UUID]BuildData{parentID: parentBD}
+	data, err := SerializeHeader(h)
+	require.NoError(t, err)
+
+	const path = "build/memfile.header"
+	provider := storedHeaderProvider(t, path, data)
+
+	stored, n, err := LoadStoredHeader(t.Context(), provider, path)
+	require.NoError(t, err)
+	require.Equal(t, len(data), n)
+	require.Equal(t, map[uuid.UUID]BuildData{parentID: parentBD}, stored.Builds)
+
+	backfilled, _, err := LoadHeader(t.Context(), provider, path)
+	require.NoError(t, err)
+	require.Equal(t, map[uuid.UUID]BuildData{parentID: parentBD, selfID: {}}, backfilled.Builds)
 }

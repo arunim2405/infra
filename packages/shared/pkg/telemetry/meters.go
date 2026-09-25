@@ -76,6 +76,13 @@ const (
 	// A non-zero rate means lost snapshots.
 	OrchestratorSnapshotUploadFailedCounterName CounterType = "orchestrator.snapshot.upload.failed"
 
+	// OrchestratorTemplateCacheAncestorResolutionsCounterName counts each
+	// ancestor build once per ancestor walk, by the path that resolved it
+	// (verdict) and what landed in the child header's Builds map (resolution).
+	// The memfile and rootfs mappings are walked separately, on each upload
+	// attempt that reaches its header stage.
+	OrchestratorTemplateCacheAncestorResolutionsCounterName CounterType = "orchestrator.templates.cache.ancestor_resolutions"
+
 	// SandboxPauseFsQuiescedCounterName counts filesystem-only pauses by whether
 	// the captured rootfs was frozen (quiesced=true, crash-consistent) vs a plain
 	// sync fallback (quiesced=false). quiesced/total is the fraction of newly
@@ -643,6 +650,8 @@ var counterDesc = map[CounterType]string{
 	TCPFirewallErrorsTotal:                       "Total number of TCP firewall errors",
 	TCPFirewallDecisionsTotal:                    "Total number of TCP firewall allow/block decisions",
 
+	OrchestratorTemplateCacheAncestorResolutionsCounterName: "Ancestor builds resolved by snapshot uploads, labeled by verdict and resolution",
+
 	IngressProxyConnectionsBlockedTotal: "Total number of ingress proxy connections blocked by connection limit",
 	CmuxErrorsTotal:                     "Total number of cmux connection multiplexer errors",
 
@@ -706,6 +715,8 @@ var counterUnits = map[CounterType]string{
 	TCPFirewallConnectionsTotal:                  "{connection}",
 	TCPFirewallErrorsTotal:                       "{error}",
 	TCPFirewallDecisionsTotal:                    "{decision}",
+
+	OrchestratorTemplateCacheAncestorResolutionsCounterName: "{ancestor}",
 
 	IngressProxyConnectionsBlockedTotal: "{connection}",
 	CmuxErrorsTotal:                     "{error}",

@@ -19,6 +19,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template/peerclient"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
@@ -67,17 +68,18 @@ type Uploads struct {
 	persistence storage.StorageProvider
 	p2p         peerclient.Resolver
 	redis       redis.UniversalClient
+	ff          *featureflags.Client
 
 	futures *ttlcache.Cache[uuid.UUID, *utils.ErrorOnce]
 }
 
-func NewUploads(tc *template.Cache, persistence storage.StorageProvider, p2p peerclient.Resolver, redisClient redis.UniversalClient) *Uploads {
+func NewUploads(tc *template.Cache, persistence storage.StorageProvider, p2p peerclient.Resolver, redisClient redis.UniversalClient, ff *featureflags.Client) *Uploads {
 	futures := ttlcache.New(
 		ttlcache.WithTTL[uuid.UUID, *utils.ErrorOnce](futureTTL),
 	)
 	go futures.Start()
 
-	return &Uploads{tc: tc, persistence: persistence, p2p: p2p, redis: redisClient, futures: futures}
+	return &Uploads{tc: tc, persistence: persistence, p2p: p2p, redis: redisClient, ff: ff, futures: futures}
 }
 
 func (u *Uploads) Stop() {
@@ -102,11 +104,35 @@ func (u *Uploads) Start(buildID uuid.UUID) (*utils.ErrorOnce, error) {
 	return fut, nil
 }
 
-// Wait returns the parent's post-upload header, or (nil, nil) when the
-// ancestor was never opened locally and no peer is mid-upload — the caller
+// AncestorVerdict says which of Wait's paths resolved an ancestor.
+type AncestorVerdict string
+
+const (
+	// verdictEntry: the header came from the local cache entry, after any wait
+	// on the ancestor's upload future.
+	verdictEntry AncestorVerdict = "entry"
+	// verdictNoFuture: no local entry, no upload future and no peer mid-upload.
+	verdictNoFuture AncestorVerdict = "no_future"
+	// verdictFutureNoEntry: the upload future fired successfully but the local
+	// cache entry is gone. The caller keeps an entry the child already carries
+	// and otherwise heals from the stored header without LoadHeader's backfill.
+	verdictFutureNoEntry AncestorVerdict = "future_no_entry"
+	// verdictP2PPoll: the header was polled from remote storage while a peer,
+	// or a local entry still pending its upload, finished it.
+	verdictP2PPoll AncestorVerdict = "p2p_poll"
+	// verdictError: Wait failed, and so does the child's upload.
+	verdictError AncestorVerdict = "error"
+)
+
+// Wait returns the parent's post-upload header, or a nil header when the
+// ancestor is not in the local cache and no peer is mid-upload — the caller
 // usually carries its BuildData through srcHeader.Builds already, and
 // appendAncestorBuilds recovers it from the build's stored header otherwise.
-func (u *Uploads) Wait(ctx context.Context, buildID uuid.UUID, t build.DiffType) (*header.Header, error) {
+// The verdict names the path that produced the result. A future that fired
+// successfully for an entry that is gone fails the wait unless
+// SnapshotCacheAncestorStorageFallbackFlag is on, in which case it returns a
+// nil header with verdictFutureNoEntry.
+func (u *Uploads) Wait(ctx context.Context, buildID uuid.UUID, t build.DiffType) (*header.Header, AncestorVerdict, error) {
 	ctx, span := tracer.Start(ctx, "wait-for-parent-upload", trace.WithAttributes(
 		telemetry.WithBuildID(buildID.String()),
 		attribute.String("file_type", string(t)),
@@ -121,26 +147,30 @@ func (u *Uploads) Wait(ctx context.Context, buildID uuid.UUID, t build.DiffType)
 			zap.Error(err),
 		)
 
-		return nil, err
+		return nil, verdictError, err
 	}
 
 	if item := u.futures.Get(buildID); item != nil {
 		if err := item.Value().WaitWithContext(ctx); err != nil {
-			return nil, fmt.Errorf("wait for upload %s: %w", buildID, err)
+			return nil, verdictError, fmt.Errorf("wait for upload %s: %w", buildID, err)
 		}
 		if d == nil {
-			return nil, fmt.Errorf("future fired but build %s not in template cache", buildID)
+			if u.ancestorStorageFallback(ctx) {
+				return nil, verdictFutureNoEntry, nil
+			}
+
+			return nil, verdictError, fmt.Errorf("future fired but build %s not in template cache", buildID)
 		}
 
-		return d.Header(), nil
+		return d.Header(), verdictEntry, nil
 	}
 
 	if d != nil && !d.Header().IncompletePendingUpload {
-		return d.Header(), nil
+		return d.Header(), verdictEntry, nil
 	}
 
 	if d == nil && !u.p2p.IsActive(buildID.String()) {
-		return nil, nil
+		return nil, verdictNoFuture, nil
 	}
 
 	// P2P mid-upload. Poll remote storage, then swap onto the local device.
@@ -149,13 +179,23 @@ func (u *Uploads) Wait(ctx context.Context, buildID uuid.UUID, t build.DiffType)
 
 	h, err := build.PollRemoteStorageForHeader(ctx, u.persistence, buildID, t, u.subscribe(ctx, buildID), refreshHeaderBudget)
 	if err != nil {
-		return nil, err
+		return nil, verdictError, err
 	}
 	if d != nil {
 		d.SwapHeader(h)
 	}
 
-	return h, nil
+	return h, verdictP2PPoll, nil
+}
+
+// ancestorStorageFallback reads SnapshotCacheAncestorStorageFallbackFlag at
+// the wait it decides; a nil client resolves to the flag's fallback.
+func (u *Uploads) ancestorStorageFallback(ctx context.Context) bool {
+	if u.ff == nil {
+		return featureflags.SnapshotCacheAncestorStorageFallbackFlag.Fallback()
+	}
+
+	return u.ff.BoolFlag(ctx, featureflags.SnapshotCacheAncestorStorageFallbackFlag)
 }
 
 func (u *Uploads) find(ctx context.Context, buildID uuid.UUID, t build.DiffType) (block.ReadonlyDevice, error) {
