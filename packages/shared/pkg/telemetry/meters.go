@@ -91,6 +91,25 @@ const (
 	// attempt that reaches its header stage.
 	OrchestratorTemplateCacheAncestorResolutionsCounterName CounterType = "orchestrator.templates.cache.ancestor_resolutions"
 
+	// OrchestratorDeadStructureOutcomeCounterName counts every pass through
+	// the drop site of a per-pause structure that outlives its readers, labeled
+	// by structure and outcome: dropped (the flag cleared it), flag_off (the
+	// flag kept it), none (there was nothing to drop) or, for the upload's
+	// provisional header, misordered (the upload was created before the
+	// snapshot was cached). Because every pass counts, a site that ran reads
+	// nonzero whatever its flag says. The provisional header has two holders,
+	// each with its own structure value. Templates and uploads with no
+	// provisional header count none too, so none is not a per-pause count.
+	OrchestratorDeadStructureOutcomeCounterName CounterType = "orchestrator.sandbox.snapshot.dead_structure_outcome"
+
+	// OrchestratorDeadStructureBytesCounterName adds the size of a dropped
+	// per-pause structure, or of one its flag kept, labeled by structure and
+	// outcome: removed from its holder on dropped, kept on flag_off. It is not
+	// the heap the drop saves, which also depends on how long the holder would
+	// have kept it. upload_provisional_header adds none: its allocation is the
+	// one template_provisional_header counts.
+	OrchestratorDeadStructureBytesCounterName CounterType = "orchestrator.sandbox.snapshot.dead_structure_bytes"
+
 	// SandboxPauseFsQuiescedCounterName counts filesystem-only pauses by whether
 	// the captured rootfs was frozen (quiesced=true, crash-consistent) vs a plain
 	// sync fallback (quiesced=false). quiesced/total is the fraction of newly
@@ -637,6 +656,8 @@ var counterDesc = map[CounterType]string{
 	OrchestratorSandboxCheckpointCounterName:     "Number of sandbox checkpoints taken, labeled by in_place and success",
 	OrchestratorFPRResumeCounterName:             "Free-page-reporting resumes after a CoW window, labeled by outcome (inline, retry, fenced, fc_exited, abandoned)",
 	OrchestratorSnapshotUploadFailedCounterName:  "Number of pause-snapshot uploads that never landed durably",
+	OrchestratorDeadStructureOutcomeCounterName:  "Passes through a per-pause structure's drop site, by structure and outcome",
+	OrchestratorDeadStructureBytesCounterName:    "Bytes of per-pause structures dropped or kept at their drop site, by structure and outcome",
 	SandboxPauseFsQuiescedCounterName:            "Filesystem-only pauses by whether the rootfs was frozen (quiesced) vs sync fallback",
 	SandboxLifecycleUnstoppedCounterName:         "Sandbox lifecycles whose live-map entry the teardown chain reclaimed because no operation marked them stopping, by sandbox type",
 	SandboxResumeWPModeCounterName:               "Sandbox resumes by write-protect tracking mode (sync|async)",
@@ -704,6 +725,8 @@ var counterUnits = map[CounterType]string{
 	OrchestratorSandboxCheckpointCounterName:     "{checkpoint}",
 	OrchestratorFPRResumeCounterName:             "{resume}",
 	OrchestratorSnapshotUploadFailedCounterName:  "{snapshot}",
+	OrchestratorDeadStructureOutcomeCounterName:  "{pass}",
+	OrchestratorDeadStructureBytesCounterName:    "By",
 	SandboxPauseFsQuiescedCounterName:            "{snapshot}",
 	SandboxLifecycleUnstoppedCounterName:         "{sandbox}",
 	SandboxResumeWPModeCounterName:               "{resume}",

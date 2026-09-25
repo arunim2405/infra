@@ -11,13 +11,31 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/launchdarkly/go-sdk-common/v3/ldcontext"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	headers "github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
+
+var (
+	deadStructureOutcomeCounter = utils.Must(telemetry.GetCounter(meter, telemetry.OrchestratorDeadStructureOutcomeCounterName))
+
+	attrUploadProvisionalHeaderDropped = uploadProvisionalHeaderOutcomeAttr("dropped")
+	attrUploadProvisionalHeaderFlagOff = uploadProvisionalHeaderOutcomeAttr("flag_off")
+	attrUploadProvisionalHeaderNone    = uploadProvisionalHeaderOutcomeAttr("none")
+)
+
+func uploadProvisionalHeaderOutcomeAttr(outcome string) metric.MeasurementOption {
+	return metric.WithAttributeSet(attribute.NewSet(
+		attribute.String("structure", "upload_provisional_header"),
+		attribute.String("outcome", outcome),
+	))
+}
 
 type Upload struct {
 	buildID        uuid.UUID
@@ -44,6 +62,21 @@ func NewUpload(
 	useCase string,
 	objectMetadata storage.ObjectMetadata,
 ) (*Upload, error) {
+	// The provisional header only feeds AddSnapshot, which a caller that
+	// caches the snapshot runs before this; AddSnapshot counts a caller that
+	// does not. The upload never reads the header, but keeps the snapshot for
+	// its whole retry budget. It gets no bytes value: the template's holder
+	// carries the same allocation, so counting it here would count it twice.
+	switch {
+	case snap.MemorySnapshot.ProvisionalDiffHeader == nil:
+		deadStructureOutcomeCounter.Add(ctx, 1, attrUploadProvisionalHeaderNone)
+	case ff != nil && ff.BoolFlag(ctx, featureflags.SnapshotCacheDropProvisionalHeaderFlag):
+		snap.MemorySnapshot.ProvisionalDiffHeader = nil
+		deadStructureOutcomeCounter.Add(ctx, 1, attrUploadProvisionalHeaderDropped)
+	default:
+		deadStructureOutcomeCounter.Add(ctx, 1, attrUploadProvisionalHeaderFlagOff)
+	}
+
 	// Filesystem-only snapshots have no memfile (NoDiff, block size 0), so
 	// resolving its compress config would fail validation ("block size must be
 	// positive"). The memfile body and header are never uploaded anyway.

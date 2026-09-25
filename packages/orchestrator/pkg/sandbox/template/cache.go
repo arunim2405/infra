@@ -54,6 +54,9 @@ var (
 		metric.WithDescription("Requests for templates that were not cached")))
 	memfileDedupDuration = utils.Must(telemetry.GetHistogram(meter, telemetry.OrchestratorSandboxMemfileDedupDurationName))
 
+	deadStructureOutcomeMetric = utils.Must(telemetry.GetCounter(meter, telemetry.OrchestratorDeadStructureOutcomeCounterName))
+	deadStructureBytesMetric   = utils.Must(telemetry.GetCounter(meter, telemetry.OrchestratorDeadStructureBytesCounterName))
+
 	// Every trip through the eviction callback is counted, with the outcome as
 	// an attribute, so the guards have both a numerator and a denominator. A
 	// guard that never fires because no pin was ever taken and a guard that
@@ -84,6 +87,20 @@ var (
 	attrEvictionSkippedPinned    = attribute.String("reason", "skipped_pinned")
 	attrEvictionSkippedReadmit   = attribute.String("reason", "skipped_readmitted")
 )
+
+var (
+	attrTemplateProvisionalHeaderDropped = deadStructureOutcomeAttr("template_provisional_header", "dropped")
+	attrTemplateProvisionalHeaderFlagOff = deadStructureOutcomeAttr("template_provisional_header", "flag_off")
+	attrTemplateProvisionalHeaderNone    = deadStructureOutcomeAttr("template_provisional_header", "none")
+	attrUploadProvisionalHeaderMisorder  = deadStructureOutcomeAttr("upload_provisional_header", "misordered")
+)
+
+func deadStructureOutcomeAttr(structure, outcome string) metric.MeasurementOption {
+	return metric.WithAttributeSet(attribute.NewSet(
+		attribute.String("structure", structure),
+		attribute.String("outcome", outcome),
+	))
+}
 
 type Cache struct {
 	config        cfg.Config
@@ -887,6 +904,21 @@ func (c *Cache) AddSnapshot(
 		c.buildStore.Add(rootfsDiff)
 	}
 
+	// A pause produces the provisional header and diff together, so a diff
+	// without its header means the caller created the upload first, and
+	// NewUpload cleared the header. The deduped header serves correctly, only
+	// later; nothing will serve from the memfd, so let dedup release it as
+	// soon as the drain finishes rather than after the swap grace.
+	if provisionalMemfileHeader == nil && provisionalMemfileDiff != nil {
+		logger.L().Error(ctx, "provisional memfile diff without its header: the upload was created before the snapshot was cached",
+			logger.WithBuildID(buildId))
+		deadStructureOutcomeMetric.Add(ctx, 1, attrUploadProvisionalHeaderMisorder)
+		if provisionalSwapDone != nil {
+			provisionalSwapDone()
+			provisionalSwapDone = nil
+		}
+	}
+
 	// Build the local template from the provisional header (resolved now) so
 	// Memfile() doesn't block on dedup; fall back to the deduped header future.
 	// When serving a provisional header, pass the deduped header future as the
@@ -921,6 +953,10 @@ func (c *Cache) AddSnapshot(
 		}
 
 		return fmt.Errorf("failed to create template cache from storage: %w", err)
+	}
+	if provisionalMemfileHeader != nil {
+		// Read once, here: Fetch, which acts on it, starts right after.
+		storageTemplate.dropProvisionalHeader = c.flags != nil && c.flags.BoolFlag(ctx, featureflags.SnapshotCacheDropProvisionalHeaderFlag)
 	}
 
 	// Use the template that is actually resident in the cache, not the local

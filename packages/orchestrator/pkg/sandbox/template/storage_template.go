@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -35,15 +36,21 @@ type storageTemplate struct {
 	snapfile *utils.SetOnce[File]
 	metafile *utils.SetOnce[File]
 
-	memfileHeader *utils.SetOnce[*header.Header]
+	// memfileHeader is atomic because the footprint gauge reads it from the
+	// metrics goroutine without a lock.
+	memfileHeader atomic.Pointer[utils.SetOnce[*header.Header]]
 	rootfsHeader  *utils.SetOnce[*header.Header]
 	// durableMemfileHeader, when non-nil, is the header the memfile will settle
 	// on (the deduped header while a provisional header is served); Fetch wires
 	// it into the memfile device as its durable header before publishing the
 	// device, so a pause parents off it rather than the provisional header.
 	durableMemfileHeader *utils.SetOnce[*header.Header]
-	localSnapfile        File
-	localMetafile        File
+	// dropProvisionalHeader, set only on a template built from a provisional
+	// memfile header, tells Fetch to clear the holder once it has read the
+	// header.
+	dropProvisionalHeader bool
+	localSnapfile         File
+	localMetafile         File
 
 	metrics     blockmetrics.Metrics
 	persistence storage.StorageProvider
@@ -70,11 +77,10 @@ func newTemplateFromStorage(
 		return nil, fmt.Errorf("failed to create cache paths: %w", err)
 	}
 
-	return &storageTemplate{
+	t := &storageTemplate{
 		paths:                paths,
 		localSnapfile:        localSnapfile,
 		localMetafile:        localMetafile,
-		memfileHeader:        memfileHeader,
 		rootfsHeader:         rootfsHeader,
 		durableMemfileHeader: durableMemfileHeader,
 		metrics:              metrics,
@@ -83,7 +89,10 @@ func newTemplateFromStorage(
 		rootfs:               utils.NewSetOnce[block.ReadonlyDevice](),
 		snapfile:             utils.NewSetOnce[File](),
 		metafile:             utils.NewSetOnce[File](),
-	}, nil
+	}
+	t.memfileHeader.Store(memfileHeader)
+
+	return t, nil
 }
 
 func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore) {
@@ -185,7 +194,20 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 	})
 
 	wg.Go(func() error {
-		memHdr, hdrErr := t.memfileHeader.WaitWithContext(ctx)
+		holder := t.memfileHeader.Load()
+		if holder == nil {
+			// Only a Fetch after the one that dropped the holder gets here.
+			errMsg := errors.New("memfile header holder already dropped")
+			if err := t.memfile.SetError(errMsg); err != nil {
+				return fmt.Errorf("failed to set memfile error: %w", errors.Join(errMsg, err))
+			}
+
+			return nil
+		}
+		memHdr, hdrErr := holder.WaitWithContext(ctx)
+		// Before the device is published, so a caller that has the memfile
+		// also observes the drop.
+		t.dropProvisionalMemfileHeader(ctx, memHdr)
 		if hdrErr != nil {
 			errMsg := fmt.Errorf("failed to resolve memfile header: %w", hdrErr)
 			if err := t.memfile.SetError(errMsg); err != nil {
@@ -291,6 +313,35 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 
 		return
 	}
+}
+
+// dropProvisionalMemfileHeader clears the holder of a provisional memfile
+// header once Fetch has read the header h from it, and records the outcome.
+// Fetch builds the memfile device from h, and the device keeps it until the
+// deduped or the published header replaces it; headerFootprint is the
+// holder's only other reader. Only AddSnapshot builds a template from a
+// provisional header, and only it sets durableMemfileHeader.
+func (t *storageTemplate) dropProvisionalMemfileHeader(ctx context.Context, h *header.Header) {
+	if t.durableMemfileHeader == nil {
+		deadStructureOutcomeMetric.Add(ctx, 1, attrTemplateProvisionalHeaderNone)
+
+		return
+	}
+
+	var size int64
+	if h != nil {
+		size = int64(h.Mapping.ByteSize())
+	}
+	if !t.dropProvisionalHeader {
+		deadStructureOutcomeMetric.Add(ctx, 1, attrTemplateProvisionalHeaderFlagOff)
+		deadStructureBytesMetric.Add(ctx, size, attrTemplateProvisionalHeaderFlagOff)
+
+		return
+	}
+
+	t.memfileHeader.Store(nil)
+	deadStructureOutcomeMetric.Add(ctx, 1, attrTemplateProvisionalHeaderDropped)
+	deadStructureBytesMetric.Add(ctx, size, attrTemplateProvisionalHeaderDropped)
 }
 
 // Close is idempotent and safe to call concurrently. The cache can reach one
@@ -416,10 +467,11 @@ func (t *storageTemplate) headerFootprint() (entries int, bytes int) {
 	// The holders are not always the headers the devices ended up on, and the
 	// difference is retained memory. A template built from a provisional memfile
 	// header keeps that header alive in memfileHeader after SwapHeaderIfCurrent
-	// has moved the device on to the deduped one, so a paused-and-deduped
-	// template holds two distinct mappings while the device reports one. Count
-	// every distinct header the template still references.
-	for _, holder := range []*utils.SetOnce[*header.Header]{t.memfileHeader, t.rootfsHeader, t.durableMemfileHeader} {
+	// has moved the device on to the deduped one, unless Fetch dropped the
+	// holder, so a paused-and-deduped template can hold two distinct mappings
+	// while the device reports one. Count every distinct header the template
+	// still references.
+	for _, holder := range []*utils.SetOnce[*header.Header]{t.memfileHeader.Load(), t.rootfsHeader, t.durableMemfileHeader} {
 		if holder == nil {
 			continue
 		}

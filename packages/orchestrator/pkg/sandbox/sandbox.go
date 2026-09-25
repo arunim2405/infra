@@ -2359,7 +2359,8 @@ type MemorySnapshot struct {
 	// template serve immediately from the still-mapped memfd via a distinct
 	// provisional build id while dedup runs, instead of blocking a concurrent
 	// resume in storage-template-memfile on the deduped header. They feed only
-	// the local AddSnapshot path; the upload still uses DiffHeader (deduped).
+	// the local AddSnapshot path; the upload still uses DiffHeader (deduped),
+	// and NewUpload may clear ProvisionalDiffHeader once AddSnapshot has run.
 	ProvisionalDiffHeader *header.Header
 	ProvisionalDiff       build.Diff
 	// ProvisionalSwapDone, when non-nil, is invoked by the AddSnapshot swap
@@ -2586,6 +2587,9 @@ func (s *Sandbox) processMemorySnapshot(ctx context.Context, buildID uuid.UUID, 
 	} else {
 		memfd = s.memory.Memfd(ctx)
 	}
+	// Read once, here: only an inflight-serve dedup builds a packed index, and
+	// the release that may free it follows within the drain plus the swap grace.
+	dedupFreeIndex := dedupInflightServe && s.featureFlags.BoolFlag(ctx, featureflags.MemfdDedupFreeIndexFlag, sandboxLDContext(s.Runtime, s.Config))
 
 	memfileDiff, memfileDiffHeader, provMemfileHeader, provMemfileDiff, provMemfileSwapDone, err := pauseProcessMemory(
 		ctx,
@@ -2601,6 +2605,7 @@ func (s *Sandbox) processMemorySnapshot(ctx context.Context, buildID uuid.UUID, 
 		dedupDirectIO,
 		dedupBudget,
 		dedupInflightServe,
+		dedupFreeIndex,
 		keepMemfdOpen,
 	)
 	if err != nil {
@@ -3061,6 +3066,7 @@ func pauseProcessMemory(
 	dedupDirectIO bool,
 	dedupBudget block.DedupBudget,
 	dedupInflightServe bool,
+	dedupFreeIndex bool,
 	keepMemfdOpen bool,
 ) (d build.Diff, h *DiffHeader, provisionalHeader *header.Header, provisionalDiff build.Diff, provisionalSwapDone func(), e error) {
 	ctx, span := tracer.Start(ctx, "process-memory")
@@ -3092,7 +3098,7 @@ func pauseProcessMemory(
 	cache, err := fc.ExportMemory(
 		ctx, diffMetadata.Dirty, memfileDiffPath, diffMetadata.BlockSize, memfd, bgCopy,
 		originalMemfile, dedupBestEffort, dedupDirectIO, dedupBudget, diffMetadata.Empty, metaOut,
-		dedupInflightServe, keepMemfdOpen,
+		dedupInflightServe, dedupFreeIndex, keepMemfdOpen,
 	)
 	if err != nil {
 		return nil, nil, nil, nil, nil, fmt.Errorf("failed to export memory: %w", err)

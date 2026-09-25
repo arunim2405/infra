@@ -673,3 +673,78 @@ func TestAppendAncestorBuilds_CountsRemotePoll(t *testing.T) {
 	require.Equal(t, map[uuid.UUID]headers.BuildData{ancestorID: {Size: 9}}, dst)
 	require.Equal(t, map[string]int64{"p2p_poll/overwrite": 1}, delta())
 }
+
+func newDropProvisionalFF(t *testing.T, on bool) *featureflags.Client {
+	t.Helper()
+
+	td := ldtestdata.DataSource()
+	td.Update(td.Flag(featureflags.SnapshotCacheDropProvisionalHeaderFlag.Key()).VariationForAll(on))
+
+	ff, err := featureflags.NewClientWithDatasource(td)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ff.Close(context.WithoutCancel(t.Context())) })
+
+	return ff
+}
+
+// The upload keeps its snapshot for the whole retry budget but never reads the
+// provisional header, which AddSnapshot has already consumed. With the flag on
+// NewUpload clears it; with the flag off, with no flags client (resume-build),
+// or with nothing to clear, the snapshot is left as it was. Each call records
+// one outcome.
+//
+// The counter is process-wide and carries no per-run label, so the test reads
+// it as a delta and does not run in parallel. Only this test records dropped
+// or flag_off on the upload's header, but every other NewUpload records none,
+// so the none case requires at least one.
+//
+//nolint:paralleltest // reads a process-wide counter as a delta
+func TestNewUpload_DropsProvisionalHeader(t *testing.T) {
+	provisional, err := headers.NewHeader(&headers.Metadata{Version: 3, BlockSize: 4096, Size: 4096}, nil)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name        string
+		ff          *featureflags.Client
+		provisional *headers.Header
+		wantCleared bool
+		outcome     string
+	}{
+		{name: "flag on", ff: newDropProvisionalFF(t, true), provisional: provisional, wantCleared: true, outcome: "dropped"},
+		{name: "flag off", ff: newDropProvisionalFF(t, false), provisional: provisional, wantCleared: false, outcome: "flag_off"},
+		{name: "no flags client", ff: nil, provisional: provisional, wantCleared: false, outcome: "flag_off"},
+		{name: "no provisional header", ff: newDropProvisionalFF(t, true), provisional: nil, wantCleared: false, outcome: "none"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := &Snapshot{
+				BuildID:            uuid.New(),
+				FilesystemSnapshot: true,
+				RootfsBlockSize:    4096,
+				MemorySnapshot:     MemorySnapshot{ProvisionalDiffHeader: tc.provisional},
+			}
+
+			before := map[string]int64{}
+			for _, o := range []string{"dropped", "flag_off", "none"} {
+				before[o] = deadStructureOutcomeTotal(t, "upload_provisional_header", o)
+			}
+			_, err := NewUpload(t.Context(), nil, snap, nil, storage.CompressConfig{}, tc.ff, storage.UseCasePause, storage.ObjectMetadata{})
+			require.NoError(t, err)
+
+			if tc.wantCleared {
+				require.Nil(t, snap.MemorySnapshot.ProvisionalDiffHeader)
+			} else {
+				require.Same(t, tc.provisional, snap.MemorySnapshot.ProvisionalDiffHeader)
+			}
+			for _, o := range []string{"dropped", "flag_off"} {
+				want := int64(0)
+				if o == tc.outcome {
+					want = 1
+				}
+				require.Equal(t, want, deadStructureOutcomeTotal(t, "upload_provisional_header", o)-before[o], o)
+			}
+			if tc.outcome == "none" {
+				require.GreaterOrEqual(t, deadStructureOutcomeTotal(t, "upload_provisional_header", "none")-before["none"], int64(1))
+			}
+		})
+	}
+}

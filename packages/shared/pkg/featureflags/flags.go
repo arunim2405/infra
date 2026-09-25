@@ -267,6 +267,23 @@ var (
 	// wait-for-dedup behavior.
 	MemfdDedupInflightServeFlag = NewBoolFlag("memfd-dedup-inflight-serve", false)
 
+	// MemfdDedupFreeIndexFlag frees the memfd dedup cache's packed index when
+	// its memfd is released. The index only translates in-flight drain reads
+	// to memfd offsets, which cannot be served once the memfd is gone, yet it
+	// otherwise stays on the cache for as long as the diff store keeps it.
+	// Only MemfdDedupInflightServeFlag pauses build an index, so elsewhere
+	// this flag has nothing to free.
+	MemfdDedupFreeIndexFlag = NewBoolFlag("memfd-dedup-free-index", false)
+
+	// SnapshotCacheDropProvisionalHeaderFlag drops the two long-lived holders
+	// of a pause's provisional memfile header: the local template's header
+	// holder, cleared once Fetch has read it to build the memfile device, and the
+	// snapshot the upload keeps, cleared as the upload is created. The device
+	// keeps its own reference until the deduped or the published header
+	// replaces it. Only MemfdDedupInflightServeFlag pauses build a provisional
+	// header.
+	SnapshotCacheDropProvisionalHeaderFlag = NewBoolFlag("snapshot-cache-drop-provisional-header", false)
+
 	// PeerToPeerChunkTransferFlag enables peer-to-peer chunk routing.
 	PeerToPeerChunkTransferFlag = NewBoolFlag("peer-to-peer-chunk-transfer", false)
 	// PeerToPeerAsyncCheckpointFlag makes Checkpoint upload fire-and-forget instead
