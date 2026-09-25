@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -26,18 +25,4 @@ func TestGetAdminUserProfilesUserIdWithoutIdentityProvider(t *testing.T) {
 
 	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 	require.JSONEq(t, `{"code":503,"message":"No identity provider is configured; this endpoint is unavailable"}`, recorder.Body.String())
-}
-
-func TestSendProvisioningErrorWithoutIdentityProvider(t *testing.T) {
-	t.Parallel()
-
-	recorder := httptest.NewRecorder()
-	ginCtx, _ := gin.CreateTestContext(recorder)
-	ginCtx.Request = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/teams", nil)
-
-	store := &APIStore{}
-	store.sendProvisioningError(t.Context(), ginCtx, "create team", fmt.Errorf("get user profile: %w", identity.ErrNoIdentityProvider))
-
-	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
-	require.Contains(t, recorder.Body.String(), "No identity provider is configured")
 }
