@@ -36,6 +36,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/chrooted"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/events"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/gcpercent"
 	e2bhealthcheck "github.com/e2b-dev/infra/packages/orchestrator/pkg/healthcheck"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/hyperloopserver"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/localupload"
@@ -569,6 +570,17 @@ func run(config cfg.Config, opts Options) (success bool) {
 	featureFlags.SetDeploymentName(config.DomainName)
 	featureFlags.RegisterContextProvider(orchestratorContextProvider(nodeID, commitSHA))
 	featureFlags.RegisterContextProvider(instanceGroupContextProvider(config.InstanceGroupName))
+
+	// Not a service and no closer: pacing stays in force through the sandbox
+	// drain and ends with the process.
+	if usesSandboxRuntime {
+		gcController, err := gcpercent.New(tel.MeterProvider, featureFlags)
+		if err != nil {
+			logger.L().Error(ctx, "failed to create GC percent controller", zap.Error(err))
+		} else {
+			go gcController.Run(context.WithoutCancel(ctx))
+		}
+	}
 
 	// External sandbox logger routes through LaunchDarkly (LogsWriteConfigFlag),
 	// falling back to the fixed collector address. Created here so it can use the

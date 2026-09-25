@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/launchdarkly/go-sdk-common/v3/ldcontext"
+	"github.com/launchdarkly/go-sdk-common/v3/ldvalue"
+	"github.com/launchdarkly/go-server-sdk/v7/testhelpers/ldtestdata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -90,4 +92,50 @@ func TestClickhouseAsyncOfflineFallback(t *testing.T) {
 	require.False(t, ok, "offline defaults must not override writer-specific async behavior")
 	require.True(t, client.BoolFlag(t.Context(), ClickhouseAsyncInsertFlag))
 	require.True(t, client.BoolFlag(t.Context(), ClickhouseWaitForAsyncInsertFlag))
+}
+
+func TestIntFlagOverride(t *testing.T) {
+	t.Parallel()
+
+	const fallback = -1
+
+	tests := []struct {
+		name       string
+		serve      *ldvalue.Value
+		wantValue  int
+		wantServed bool
+	}{
+		{name: "served value", serve: new(ldvalue.Int(25)), wantValue: 25, wantServed: true},
+		{name: "served value equal to the fallback", serve: new(ldvalue.Int(fallback)), wantValue: fallback, wantServed: true},
+		{name: "key the environment does not define", serve: nil, wantValue: fallback, wantServed: true},
+		{name: "wrong type", serve: new(ldvalue.String("25")), wantValue: fallback, wantServed: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			source := ldtestdata.DataSource()
+			flag := IntFlag{name: "int-flag-override-test", fallback: fallback}
+			if tt.serve != nil {
+				source.Update(source.Flag(flag.Key()).ValueForAll(*tt.serve))
+			}
+
+			client, err := NewClientWithDatasource(source)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, client.Close(context.WithoutCancel(t.Context()))) })
+
+			value, served := client.IntFlagOverride(t.Context(), flag)
+			assert.Equal(t, tt.wantValue, value)
+			assert.Equal(t, tt.wantServed, served)
+		})
+	}
+}
+
+func TestIntFlagOverrideNilClient(t *testing.T) {
+	t.Parallel()
+
+	value, served := (&Client{}).IntFlagOverride(t.Context(), IntFlag{name: "int-flag-override-test", fallback: 7})
+	assert.Equal(t, 7, value)
+	assert.False(t, served)
 }

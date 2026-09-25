@@ -7,6 +7,7 @@ import (
 
 	"github.com/launchdarkly/go-sdk-common/v3/ldcontext"
 	"github.com/launchdarkly/go-sdk-common/v3/ldlog"
+	"github.com/launchdarkly/go-sdk-common/v3/ldreason"
 	"github.com/launchdarkly/go-sdk-common/v3/ldvalue"
 	ldclient "github.com/launchdarkly/go-server-sdk/v7"
 	"github.com/launchdarkly/go-server-sdk/v7/interfaces"
@@ -150,6 +151,27 @@ func (c *Client) WatchJSONFlag(ctx context.Context, flag JSONFlag, contexts ...l
 
 func (c *Client) IntFlag(ctx context.Context, flag IntFlag, contexts ...ldcontext.Context) int {
 	return getFlag(ctx, c.ld, c.ld.IntVariationCtx, flag, c.allContexts(ctx, contexts))
+}
+
+// IntFlagOverride returns the flag's value and whether LaunchDarkly served it.
+// On a failed evaluation — a client in LaunchDarkly's offline mode or not yet
+// initialised, a value of the wrong type — the value is the fallback and the
+// second result is false, so a caller can tell a served value from one equal
+// to the fallback. A key the environment does not define counts as served at
+// the fallback: nobody has chosen a value, which is what the fallback stands
+// for, and an environment that never creates the flag is not failing. The
+// keyless client (the package's offline store) serves every NewIntFlag flag
+// at its fallback, which counts as served too.
+func (c *Client) IntFlagOverride(ctx context.Context, flag IntFlag, contexts ...ldcontext.Context) (int, bool) {
+	if c.ld == nil {
+		return flag.Fallback(), false
+	}
+	value, detail, err := c.ld.IntVariationDetailCtx(ctx, flag.Key(), mergeContexts(ctx, c.allContexts(ctx, contexts)), flag.Fallback())
+	if detail.Reason.GetErrorKind() == ldreason.EvalErrorFlagNotFound {
+		return flag.Fallback(), true
+	}
+
+	return value, err == nil && !detail.IsDefaultValue()
 }
 
 func (c *Client) StringFlag(ctx context.Context, flag StringFlag, contexts ...ldcontext.Context) string {

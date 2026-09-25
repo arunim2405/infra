@@ -462,6 +462,11 @@ var (
 	// 0 probes the parent header's readiness without waiting; a positive value
 	// waits up to that long before refusing retryably.
 	PauseAdmissionGraceMs = NewIntFlag("pause-admission-grace-milliseconds", -1)
+	// OrchestratorGOGCPercentFlag sets the orchestrator's Go GC percent. 10 to
+	// 100 is written with debug.SetGCPercent. -1 (default) and any other
+	// value, 0 included, keep the percent read when the controller was built:
+	// nothing is written unless an applied value has to be undone.
+	OrchestratorGOGCPercentFlag = NewIntFlag("orchestrator-gogc-percent", -1)
 	// PauseRefusalRestoreFlag gates the API-side restore of a retryably
 	// refused pause: record kept, routing re-registered, state back to
 	// Running. Off (default), a refused pause still ends today's way — the

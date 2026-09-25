@@ -564,6 +564,10 @@ const (
 	FirecrackerProcessesUnknownMaxLength GaugeIntType = "orchestrator.firecracker.processes.unknown_max_length"
 	FirecrackerTrackerSuccess            GaugeIntType = "orchestrator.firecracker.tracker.success"
 	FirecrackerTrackerLastSuccessAge     GaugeIntType = "orchestrator.firecracker.tracker.last_success_age"
+	// OrchestratorGOGCOutcomeGaugeName reports the GC percent controller's
+	// outcome as a state set: every outcome (applied|disabled|refused|error)
+	// on every collection, 1 for the current one and 0 for the rest.
+	OrchestratorGOGCOutcomeGaugeName GaugeIntType = "orchestrator.go.gogc.outcome"
 
 	// Orchestrator node resources allocated to running sandboxes (sum across running sandboxes)
 	OrchestratorCpuAllocatedGaugeName    GaugeIntType = "orchestrator.sandbox.cpu.allocated"
@@ -777,6 +781,7 @@ var gaugeFloatUnits = map[GaugeFloatType]string{
 }
 
 var gaugeIntDesc = map[GaugeIntType]string{
+	OrchestratorGOGCOutcomeGaugeName:     "1 for the GC percent controller's current outcome and 0 for the other three; go.config.gogc is the percent in force.",
 	FirecrackerProcesses:                 "Non-exited Firecracker OS processes in the tracker's last complete scan.",
 	FirecrackerProcessesUntracked:        "Firecracker processes older than five minutes and absent from lifecycle tracking.",
 	FirecrackerProcessesOverMaxLength:    "Customer Firecracker processes beyond their known sandbox start plus maximum length; excludes builds and temporary VMs.",
@@ -807,6 +812,7 @@ var gaugeIntDesc = map[GaugeIntType]string{
 }
 
 var gaugeIntUnits = map[GaugeIntType]string{
+	OrchestratorGOGCOutcomeGaugeName:     "1",
 	FirecrackerProcesses:                 "{process}",
 	FirecrackerProcessesUntracked:        "{process}",
 	FirecrackerProcessesOverMaxLength:    "{process}",
