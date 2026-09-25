@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/launchdarkly/go-sdk-common/v3/ldcontext"
@@ -16,9 +17,11 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/fcversion"
+	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
@@ -667,8 +670,10 @@ var ReclaimConfigFlag = NewJSONFlag("guest-pause-reclaim", ldvalue.Null())
 // race fixed in https://lore.kernel.org/lkml/20240429125100.7393-1-david@redhat.com/
 // is on the hinting flow, gated by the per-use-case timeouts below).
 // "pause"/"build" are pre-pause drain timeouts in ms keyed by SnapshotUseCase;
-// missing/zero/negative disables the drain for that use case.
-// Example: {"enabled": true, "pause": 500, "build": 0}
+// missing/zero/negative disables the drain for that use case. "stop" and
+// "stop_grace" bound the stop of a cycle that outlived its budget (see
+// GetPrePauseHintConfig).
+// Example: {"enabled": true, "pause": 500, "build": 0, "stop": 2000, "stop_grace": 100}
 var FreePageHintingConfig = NewJSONFlag("free-page-hinting-config", ldvalue.Null())
 
 // IsFreePageHintingEnabled reports whether FPH should be configured on the
@@ -677,16 +682,158 @@ func IsFreePageHintingEnabled(ctx context.Context, ff *Client, contexts ...ldcon
 	return ff.JSONFlag(ctx, FreePageHintingConfig, contexts...).GetByKey("enabled").BoolValue()
 }
 
-// GetFreePageHintingTimeout returns the pre-pause FPH drain timeout for the
-// given SnapshotUseCase. Zero means disabled.
-func GetFreePageHintingTimeout(ctx context.Context, ff *Client, useCase string, contexts ...ldcontext.Context) time.Duration {
-	ms := ff.JSONFlag(ctx, FreePageHintingConfig, contexts...).GetByKey(useCase).IntValue()
-	if ms <= 0 {
-		return 0
+// HintStopConfig bounds the stop of a hinting cycle the host stopped waiting
+// for; every hinting drain shares it ("stop", "stop_grace" in
+// FreePageHintingConfig, milliseconds).
+type HintStopConfig struct {
+	// Timeout bounds the stop; zero leaves such a cycle running, which is the
+	// behaviour before the stop existed and the rollback lever for it.
+	Timeout time.Duration
+	// Grace is how long the stop waits for a guest that has not echoed the
+	// cycle's command before taking it to have never read it.
+	Grace time.Duration
+}
+
+// PrePauseHintConfig is what the pre-pause drain reads from
+// FreePageHintingConfig for one SnapshotUseCase.
+type PrePauseHintConfig struct {
+	// Timeout is the drain budget; zero disables the drain for the use case.
+	Timeout time.Duration
+	Stop    HintStopConfig
+}
+
+const (
+	defaultHintStopTimeout = 2 * time.Second
+	defaultHintStopGrace   = 100 * time.Millisecond
+)
+
+// flagMillis reads key from v as a non-negative duration in milliseconds, def
+// when absent or not a number.
+func flagMillis(v ldvalue.Value, key string, def time.Duration) time.Duration {
+	x := v.GetByKey(key)
+	if !x.IsNumber() {
+		return def
 	}
 
-	return time.Duration(ms) * time.Millisecond
+	return max(time.Duration(x.IntValue())*time.Millisecond, 0)
 }
+
+func hintStopConfig(v ldvalue.Value) HintStopConfig {
+	return HintStopConfig{
+		Timeout: flagMillis(v, "stop", defaultHintStopTimeout),
+		Grace:   flagMillis(v, "stop_grace", defaultHintStopGrace),
+	}
+}
+
+// GetPrePauseHintConfig reads the drain budget for useCase ("pause", "build")
+// and the shared stop settings.
+// Example: {"enabled": true, "pause": 500, "build": 0, "stop": 2000, "stop_grace": 100}
+func GetPrePauseHintConfig(ctx context.Context, ff *Client, useCase string, contexts ...ldcontext.Context) PrePauseHintConfig {
+	v := ff.JSONFlag(ctx, FreePageHintingConfig, contexts...)
+
+	return PrePauseHintConfig{Timeout: flagMillis(v, useCase, 0), Stop: hintStopConfig(v)}
+}
+
+// PeriodicHintingConfig is the "periodic" object of FreePageHintingConfig:
+// host-driven free-page-hinting runs that replace continuous free-page
+// reporting. Example:
+//
+//	{"enabled": true, "pause": 500, "stop": 2000, "stop_grace": 100,
+//	 "periodic": {"interval": 15000, "timeout": 500, "quiet_after_start": 10000}}
+//
+// interval <= 0 disables the loop, and so does an interval under a second (the
+// field is in milliseconds; a value typed in seconds would be a tight loop
+// against every guest); timeout <= 0 falls back to 500 ms; quiet_after_start
+// clamps at 0. The stop settings are the shared top-level ones. observe_only
+// keeps the loop ticking and recording the interval baseline without ever
+// hinting: the control cohort a ramp is read against.
+//
+// silent_runs is how many runs in a row a guest may sit out (never echoing the
+// command, or a start FC refuses) before the loop backs off to
+// unresponsive_retry between attempts; 0 never backs off. host_slots bounds the
+// runs in flight on one host; 0 is unbounded.
+type PeriodicHintingConfig struct {
+	Interval        time.Duration
+	Timeout         time.Duration
+	QuietAfterStart time.Duration
+	// ObserveOnly ticks and records the interval baseline but never hints: a
+	// control cohort on hinting templates.
+	ObserveOnly       bool
+	SilentRuns        int
+	UnresponsiveRetry time.Duration
+	HostSlots         int
+	Stop              HintStopConfig
+}
+
+func (c PeriodicHintingConfig) Enabled() bool { return c.Interval > 0 }
+
+const (
+	minPeriodicHintingInterval = time.Second
+	defaultPeriodicHintTimeout = 500 * time.Millisecond
+)
+
+// GetPeriodicHintingConfig reads the periodic block; missing fields take the
+// defaults above, a missing block or interval <= 0 disables the loop.
+func GetPeriodicHintingConfig(ctx context.Context, ff *Client, contexts ...ldcontext.Context) PeriodicHintingConfig {
+	top := ff.JSONFlag(ctx, FreePageHintingConfig, contexts...)
+	v := top.GetByKey("periodic")
+	// A mistyped field silently falling back would disable the loop with
+	// nothing to say why; the read path runs per sandbox per tick, so each
+	// complaint is made once per process.
+	complain := func(field, why string, x ldvalue.Value) {
+		if _, dup := periodicHintingComplaints.LoadOrStore(field+":"+why, struct{}{}); !dup {
+			logger.L().Warn(ctx, "free-page-hinting-config periodic: "+why, zap.String("field", field), zap.String("value", x.JSONString()))
+		}
+	}
+	if !v.IsNull() && v.Type() != ldvalue.ObjectType {
+		complain("periodic", "not an object; periodic hinting off", v)
+	}
+	num := func(key string, def int64) int64 {
+		x := v.GetByKey(key)
+		if x.IsNumber() {
+			return int64(x.IntValue())
+		}
+		if !x.IsNull() {
+			complain(key, "not a number; using the default", x)
+		}
+
+		return def
+	}
+	ms := func(key string, def int64) time.Duration { return time.Duration(num(key, def)) * time.Millisecond }
+	boolean := func(key string) bool {
+		x := v.GetByKey(key)
+		if x.IsBool() {
+			return x.BoolValue()
+		}
+		if !x.IsNull() {
+			complain(key, "not a boolean; using the default", x)
+		}
+
+		return false
+	}
+	cfg := PeriodicHintingConfig{
+		Interval:          max(ms("interval", 0), 0),
+		Timeout:           ms("timeout", defaultPeriodicHintTimeout.Milliseconds()),
+		QuietAfterStart:   max(ms("quiet_after_start", 10000), 0),
+		SilentRuns:        int(max(num("silent_runs", 3), 0)),
+		UnresponsiveRetry: max(ms("unresponsive_retry", 300000), 0),
+		HostSlots:         int(max(num("host_slots", 16), 0)),
+		Stop:              hintStopConfig(top),
+		ObserveOnly:       boolean("observe_only"),
+	}
+	if cfg.Interval > 0 && cfg.Interval < minPeriodicHintingInterval {
+		complain("interval", "below the one-second floor; periodic hinting off", v.GetByKey("interval"))
+		cfg.Interval = 0
+	}
+	// A non-positive timeout would start guest cycles and abandon them at once.
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultPeriodicHintTimeout
+	}
+
+	return cfg
+}
+
+var periodicHintingComplaints sync.Map
 
 type ReclaimConfig struct {
 	Sync          time.Duration

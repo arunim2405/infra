@@ -400,6 +400,8 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	if err := s.markSandboxLive(ctx, sbx, reservation); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to register sandbox: %s", err)
 	}
+	// Read off the start path; unknown here means the read has not landed yet.
+	childSpan.SetAttributes(attribute.String("balloon_mode", sbx.BalloonMode()))
 
 	// Read scheduling metadata after the sandbox resumed so the template's
 	// memfile/rootfs devices (and their headers) are resolved.
@@ -498,6 +500,7 @@ func (s *Server) Update(ctx context.Context, req *orchestrator.SandboxUpdateRequ
 		telemetry.WithFirecrackerVersion(sbx.Config.FirecrackerConfig.FirecrackerVersion),
 		telemetry.WithKernelVersion(sbx.Config.FirecrackerConfig.KernelVersion),
 		telemetry.WithEnvdVersion(sbx.Config.Envd.Version),
+		attribute.String("balloon_mode", sbx.BalloonMode()),
 	)
 
 	// Mirror the Create-side BYOP gates; defense-in-depth for direct gRPC
@@ -714,6 +717,7 @@ func (s *Server) Delete(ctxConn context.Context, in *orchestrator.SandboxDeleteR
 		telemetry.WithFirecrackerVersion(sbx.Config.FirecrackerConfig.FirecrackerVersion),
 		telemetry.WithKernelVersion(sbx.Config.FirecrackerConfig.KernelVersion),
 		telemetry.WithEnvdVersion(sbx.Config.Envd.Version),
+		attribute.String("balloon_mode", sbx.BalloonMode()),
 	)
 
 	// Mark the sandbox as stopping so it is excluded from live queries (Get, Items,
@@ -924,6 +928,7 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 		telemetry.WithFirecrackerVersion(sbx.Config.FirecrackerConfig.FirecrackerVersion),
 		telemetry.WithKernelVersion(sbx.Config.FirecrackerConfig.KernelVersion),
 		telemetry.WithEnvdVersion(sbx.Config.Envd.Version),
+		attribute.String("balloon_mode", sbx.BalloonMode()),
 	)
 
 	// Flag-gated admission pre-flight: refuse retryably BEFORE any destructive
@@ -1096,6 +1101,7 @@ func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpo
 		telemetry.WithFirecrackerVersion(sbx.Config.FirecrackerConfig.FirecrackerVersion),
 		telemetry.WithKernelVersion(sbx.Config.FirecrackerConfig.KernelVersion),
 		telemetry.WithEnvdVersion(sbx.Config.Envd.Version),
+		attribute.String("balloon_mode", sbx.BalloonMode()),
 	)
 
 	// Check envd version before snapshotting.

@@ -146,6 +146,12 @@ type Prefetch struct {
 	Memory *MemoryPrefetchMapping `json:"memory"`
 }
 
+// Balloon is the balloon device configuration a template was built with.
+type Balloon struct {
+	Reporting bool `json:"reporting"`
+	Hinting   bool `json:"hinting"`
+}
+
 type Template struct {
 	Version      uint64           `json:"version"`
 	Template     TemplateMetadata `json:"template"`
@@ -173,6 +179,15 @@ type Template struct {
 	// It exists so the cold boot of a filesystem-only snapshot can re-apply the same command
 	// line; a memory resume restores a running kernel and never re-reads it.
 	CmdlineArgs map[string]string `json:"cmdline_args,omitempty"`
+
+	// Balloon records the free-page mechanisms this template's balloon was
+	// built with. It is lineage state like CmdlineArgs: chosen once at build,
+	// carried by the copy-constructors, and it is what lets a resume label its
+	// first faults before the VM starts. Nil is a template built before the
+	// field existed; the mode is then read from the device after start.
+	// Sandbox.Pause re-stamps it from device truth when that is known, so a
+	// cold-booted lineage (no balloon) does not inherit its template's.
+	Balloon *Balloon `json:"balloon,omitempty"`
 
 	// FilesystemOnly marks a snapshot that persists only the filesystem (no
 	// memory snapshot); resuming it must cold-boot (reboot) from the rootfs. The
@@ -268,6 +283,7 @@ func (t Template) NewVersionTemplate(metadata TemplateMetadata) Template {
 		FromTemplate: t.FromTemplate,
 		FromImage:    t.FromImage,
 		CmdlineArgs:  t.CmdlineArgs,
+		Balloon:      t.Balloon,
 	}
 }
 
@@ -280,7 +296,16 @@ func (t Template) SameVersionTemplate(metadata TemplateMetadata) Template {
 		FromTemplate: t.FromTemplate,
 		FromImage:    t.FromImage,
 		CmdlineArgs:  t.CmdlineArgs,
+		Balloon:      t.Balloon,
 	}
+}
+
+// WithBalloon returns a copy of the template stamped with the balloon
+// mechanisms the device actually runs.
+func (t Template) WithBalloon(reporting, hinting bool) Template {
+	t.Balloon = &Balloon{Reporting: reporting, Hinting: hinting}
+
+	return t
 }
 
 // WithPrefetch returns a copy of the template with the given prefetch mapping.
@@ -294,6 +319,7 @@ func (t Template) WithPrefetch(prefetch *Prefetch) Template {
 		FromImage:    t.FromImage,
 		Prefetch:     prefetch,
 		CmdlineArgs:  t.CmdlineArgs,
+		Balloon:      t.Balloon,
 	}
 }
 

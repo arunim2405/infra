@@ -132,6 +132,9 @@ func (ppb *PostProcessingBuilder) Layer(
 	if len(ppb.Config.CmdlineArgs) > 0 {
 		result.CmdlineArgs = maps.Clone(ppb.Config.CmdlineArgs)
 	}
+	// The balloon this build's VM was configured with, for the same reason and
+	// with the same unconditional assignment.
+	result.Balloon = &metadata.Balloon{Reporting: ppb.Config.FreePageReporting, Hinting: ppb.Config.FreePageHinting}
 
 	return phases.LayerResult{
 		Metadata: result,

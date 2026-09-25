@@ -64,6 +64,8 @@ func (c *Checks) Start(ctx context.Context) {
 	ctx, c.cancelCtx = context.WithCancelCause(ctx)
 	c.mu.Unlock()
 
+	go c.sandbox.labelBalloonMode(ctx)
+	go c.sandbox.runPeriodicHinting(ctx)
 	c.logHealth(ctx)
 }
 

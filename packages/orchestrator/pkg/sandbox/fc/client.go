@@ -10,7 +10,6 @@ import (
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/firecracker-microvm/firecracker-go-sdk"
-	openapiruntime "github.com/go-openapi/runtime"
 	"github.com/go-openapi/strfmt"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -474,6 +473,16 @@ func (c *apiClient) installBalloon(ctx context.Context, freePageReporting, freeP
 	return nil
 }
 
+// swaggerSuccess reports whether err is go-swagger's rendering of a 2xx the
+// spec did not declare (FC answers 204 where the spec says 200/400): both the
+// generic *openapiruntime.APIError and the typed default responses expose
+// IsSuccess.
+func swaggerSuccess(err error) bool {
+	var ok interface{ IsSuccess() bool }
+
+	return errors.As(err, &ok) && ok.IsSuccess()
+}
+
 func (c *apiClient) startBalloonHinting(ctx context.Context, acknowledgeOnStop bool) error {
 	params := operations.StartBalloonHintingParams{
 		Context: ctx,
@@ -481,15 +490,31 @@ func (c *apiClient) startBalloonHinting(ctx context.Context, acknowledgeOnStop b
 	}
 	_, err := c.client.Operations.StartBalloonHinting(&params)
 	if err != nil {
-		// FC returns 204 (no content) on success, but the FC OpenAPI spec only
-		// declares 200/400 — go-swagger treats any other 2xx as "unexpected
-		// success" and surfaces it as a *runtime.APIError. Honour the 2xx.
-		var apiErr *openapiruntime.APIError
-		if errors.As(err, &apiErr) && apiErr.IsSuccess() {
+		if swaggerSuccess(err) {
 			return nil
 		}
 
 		return fmt.Errorf("error starting balloon hinting: %w", err)
+	}
+
+	return nil
+}
+
+// errHintingStopRefused is FC's 400 on stop: hinting not enabled on the
+// balloon, or the device not yet active. Either way no cycle is running.
+var errHintingStopRefused = errors.New("balloon hinting stop refused")
+
+func (c *apiClient) stopBalloonHinting(ctx context.Context) error {
+	params := operations.StopBalloonHintingParams{Context: ctx}
+	if _, err := c.client.Operations.StopBalloonHinting(&params); err != nil {
+		if swaggerSuccess(err) {
+			return nil
+		}
+		if _, ok := errors.AsType[*operations.StopBalloonHintingBadRequest](err); ok {
+			return fmt.Errorf("%w: %w", errHintingStopRefused, err)
+		}
+
+		return fmt.Errorf("error stopping balloon hinting: %w", err)
 	}
 
 	return nil
@@ -503,13 +528,7 @@ func (c *apiClient) startBalloonHinting(ctx context.Context, acknowledgeOnStop b
 func (c *apiClient) pauseFreePageReporting(ctx context.Context) error {
 	params := operations.PauseBalloonReportingParams{Context: ctx}
 	if _, err := c.client.Operations.PauseBalloonReporting(&params); err != nil {
-		// FC returns 204 (no content) on success, but the spec declares 200 —
-		// go-swagger routes the 204 into the default-response error (or a
-		// *runtime.APIError when no default is declared). Honour any 2xx.
-		var defErr *operations.PauseBalloonReportingDefault
-		var apiErr *openapiruntime.APIError
-		if (errors.As(err, &defErr) && defErr.IsSuccess()) ||
-			(errors.As(err, &apiErr) && apiErr.IsSuccess()) {
+		if swaggerSuccess(err) {
 			return nil
 		}
 
@@ -524,11 +543,7 @@ func (c *apiClient) pauseFreePageReporting(ctx context.Context) error {
 func (c *apiClient) resumeFreePageReporting(ctx context.Context) error {
 	params := operations.ResumeBalloonReportingParams{Context: ctx}
 	if _, err := c.client.Operations.ResumeBalloonReporting(&params); err != nil {
-		// Same 204-on-success handling as pauseFreePageReporting above.
-		var defErr *operations.ResumeBalloonReportingDefault
-		var apiErr *openapiruntime.APIError
-		if (errors.As(err, &defErr) && defErr.IsSuccess()) ||
-			(errors.As(err, &apiErr) && apiErr.IsSuccess()) {
+		if swaggerSuccess(err) {
 			return nil
 		}
 
@@ -561,32 +576,50 @@ func (c *apiClient) freePageReportingPaused(ctx context.Context) (bool, error) {
 // resumed sandbox cannot know from its config (the device travels with the
 // snapshot). A VM without a balloon reports false.
 func (c *apiClient) balloonFreePageReporting(ctx context.Context) (bool, error) {
+	cfg, err := c.describeBalloonConfig(ctx)
+	if err != nil || cfg == nil {
+		return false, err
+	}
+
+	return cfg.FreePageReporting, nil
+}
+
+// describeBalloonConfig returns the balloon device config, or nil when no
+// balloon is installed (FC answers 400).
+func (c *apiClient) describeBalloonConfig(ctx context.Context) (*models.Balloon, error) {
 	params := operations.DescribeBalloonConfigParams{Context: ctx}
 	res, err := c.client.Operations.DescribeBalloonConfig(&params)
 	if err != nil {
-		// FC answers 400 when no balloon device is installed: no balloon, no
-		// free-page reporting.
 		if _, ok := errors.AsType[*operations.DescribeBalloonConfigBadRequest](err); ok {
-			return false, nil
+			return nil, nil
 		}
 
-		return false, fmt.Errorf("error describing balloon config: %w", err)
+		return nil, fmt.Errorf("error describing balloon config: %w", err)
 	}
 
-	return res.Payload.FreePageReporting, nil
+	return res.Payload, nil
 }
 
-func (c *apiClient) describeBalloonHinting(ctx context.Context) (hostCmd int64, err error) {
+// hintingStatus is FC's view of the hinting handshake: the last command the
+// host issued and the last one the guest wrote back. An absent guest_cmd
+// decodes as freePageHintStop (the guest has nothing in flight either way).
+type hintingStatus struct {
+	hostCmd  int64
+	guestCmd int64
+}
+
+func (c *apiClient) describeBalloonHinting(ctx context.Context) (hintingStatus, error) {
 	params := operations.DescribeBalloonHintingParams{Context: ctx}
 	res, err := c.client.Operations.DescribeBalloonHinting(&params)
 	if err != nil {
-		return 0, err
+		return hintingStatus{}, err
 	}
+	st := hintingStatus{guestCmd: res.Payload.GuestCmd}
 	if res.Payload.HostCmd != nil {
-		hostCmd = *res.Payload.HostCmd
+		st.hostCmd = *res.Payload.HostCmd
 	}
 
-	return hostCmd, nil
+	return st, nil
 }
 
 func (c *apiClient) memoryMapping(ctx context.Context) (*memory.Mapping, error) {

@@ -27,6 +27,7 @@ const waitForInit = 5 * time.Second
 
 type Client struct {
 	ld               *ldclient.LDClient
+	static           bool
 	deploymentName   string
 	serviceName      string
 	contextProviders []ContextProvider
@@ -58,7 +59,13 @@ func NewClientWithDatasource(source *ldtestdata.TestDataSource) (*Client, error)
 
 func NewClient() (*Client, error) {
 	if launchDarklyApiKey == "" {
-		return NewClientWithDatasource(launchDarklyOfflineStore)
+		c, err := NewClientWithDatasource(launchDarklyOfflineStore)
+		if err != nil {
+			return nil, err
+		}
+		c.static = true
+
+		return c, nil
 	}
 
 	ldClient, err := ldclient.MakeClient(launchDarklyApiKey, waitForInit)
@@ -86,7 +93,7 @@ func NewClientWithLogLevel(logLevel ldlog.LogLevel) (*Client, error) {
 			return nil, err
 		}
 
-		return &Client{ld: ldClient}, nil
+		return &Client{ld: ldClient, static: true}, nil
 	}
 
 	ldClient, err := ldclient.MakeCustomClient(launchDarklyApiKey, cfg, waitForInit)
@@ -95,6 +102,13 @@ func NewClientWithLogLevel(logLevel ldlog.LogLevel) (*Client, error) {
 	}
 
 	return &Client{ld: ldClient}, nil
+}
+
+// Live reports whether flag values can change at runtime. A client built
+// without an API key serves the offline store's values for the life of the
+// process, and a nil client serves fallbacks.
+func (c *Client) Live() bool {
+	return c != nil && c.ld != nil && !c.static
 }
 
 func (c *Client) SetDeploymentName(deploymentName string) {

@@ -78,6 +78,14 @@ const (
 	// is lasting per-sandbox host-memory retention and the alertable signal
 	// for a leaked pause.
 	OrchestratorFPRResumeCounterName CounterType = "orchestrator.sandbox.fpr_resume"
+	// Free-page-hinting drains and runs by phase (pre-pause, periodic) and outcome.
+	OrchestratorFPHRunCounterName CounterType = "orchestrator.sandbox.fph.run"
+	// Stops of hinting cycles the host stopped waiting for, by outcome.
+	OrchestratorFPHStopCounterName CounterType = "orchestrator.sandbox.fph.stop"
+	// Bytes FC discarded across completed drains and runs, by phase.
+	OrchestratorFPHFreedCounterName CounterType = "orchestrator.sandbox.fph.freed_bytes"
+	// Guests the periodic hinter latched as unable to hint, and released.
+	OrchestratorFPHLatchCounterName CounterType = "orchestrator.sandbox.fph.latch"
 
 	// OrchestratorSnapshotUploadFailedCounterName counts pause-snapshot uploads
 	// that never landed durably (budget exhausted or a non-retryable error).
@@ -384,6 +392,9 @@ const (
 
 const (
 	// Build timing histograms
+	FPHRunDurationName              HistogramType = "orchestrator.sandbox.fph.duration"
+	FPHStopDurationName             HistogramType = "orchestrator.sandbox.fph.stop.duration"
+	FPHRunFaultsName                HistogramType = "orchestrator.sandbox.fph.run.faults"
 	BuildDurationHistogramName      HistogramType = "template.build.duration"
 	BuildPhaseDurationHistogramName HistogramType = "template.build.phase.duration"
 	BuildStepDurationHistogramName  HistogramType = "template.build.step.duration"
@@ -655,6 +666,10 @@ var counterDesc = map[CounterType]string{
 	OrchestratorSandboxPauseAdmissionCounterName: "Snapshot-admission decisions, labeled by outcome (ready/ready_after_wait/refused/latched_error) and rpc (pause/checkpoint)",
 	OrchestratorSandboxCheckpointCounterName:     "Number of sandbox checkpoints taken, labeled by in_place and success",
 	OrchestratorFPRResumeCounterName:             "Free-page-reporting resumes after a CoW window, labeled by outcome (inline, retry, fenced, fc_exited, abandoned)",
+	OrchestratorFPHRunCounterName:                "Free-page-hinting drains and runs, labeled by phase (pre-pause, periodic) and outcome (ok, not-configured, refused, timeout, timeout-guest-silent, failed, cancelled, skipped-<reason> incl. skipped-host-busy)",
+	OrchestratorFPHStopCounterName:               "Stops of hinting cycles the host stopped waiting for, labeled by outcome (ok, unacked, failed, skipped-exited, skipped-disabled)",
+	OrchestratorFPHFreedCounterName:              "Bytes discarded by completed free-page-hinting drains and runs (FC free_page_hint_freed before the drain and after a metrics flush that follows it), labeled by phase",
+	OrchestratorFPHLatchCounterName:              "Guests the periodic hinter latched as unable to hint after consecutive sat-out runs, released by a completed run, or dropped with the loop that held the latch (state: latched, released, dropped)",
 	OrchestratorSnapshotUploadFailedCounterName:  "Number of pause-snapshot uploads that never landed durably",
 	OrchestratorDeadStructureOutcomeCounterName:  "Passes through a per-pause structure's drop site, by structure and outcome",
 	OrchestratorDeadStructureBytesCounterName:    "Bytes of per-pause structures dropped or kept at their drop site, by structure and outcome",
@@ -724,6 +739,10 @@ var counterUnits = map[CounterType]string{
 	OrchestratorSandboxPauseAdmissionCounterName: "{decision}",
 	OrchestratorSandboxCheckpointCounterName:     "{checkpoint}",
 	OrchestratorFPRResumeCounterName:             "{resume}",
+	OrchestratorFPHRunCounterName:                "{run}",
+	OrchestratorFPHStopCounterName:               "{stop}",
+	OrchestratorFPHFreedCounterName:              "By",
+	OrchestratorFPHLatchCounterName:              "{transition}",
 	OrchestratorSnapshotUploadFailedCounterName:  "{snapshot}",
 	OrchestratorDeadStructureOutcomeCounterName:  "{pass}",
 	OrchestratorDeadStructureBytesCounterName:    "By",
@@ -941,6 +960,9 @@ func GetGaugeInt(meter metric.Meter, name GaugeIntType) (metric.Int64ObservableG
 var histogramDesc = map[HistogramType]string{
 	ApiRedisStoragePublisherPublishDuration: "Duration of a single Redis PUBLISH round-trip from the storage publisher",
 
+	FPHRunDurationName:                                "Duration of a completed free-page-hinting drain or run, labeled by phase",
+	FPHStopDurationName:                               "Duration of the stop of an abandoned hinting cycle, acknowledgement wait included",
+	FPHRunFaultsName:                                  "Demand faults the serve loop resolved for one sandbox across a periodic hinting attempt (window=run) and over the interval that followed a tick (window=interval), labeled by kind (served pages, deferred installs, wp faults, deferred wp resolves) and outcome: the attempt's run outcome, or for a tick that attempted nothing the skip reason or observe-only, which is the baseline an attempt is read against",
 	BuildDurationHistogramName:                        "Time taken to build a template",
 	BuildPhaseDurationHistogramName:                   "Time taken to build each phase of a template",
 	BuildStepDurationHistogramName:                    "Time taken to build each step of a template",
@@ -1015,6 +1037,9 @@ var histogramDesc = map[HistogramType]string{
 var histogramUnits = map[HistogramType]string{
 	ApiRedisStoragePublisherPublishDuration: "ms",
 
+	FPHRunDurationName:                                "ms",
+	FPHStopDurationName:                               "ms",
+	FPHRunFaultsName:                                  "{fault}",
 	BuildDurationHistogramName:                        "ms",
 	BuildPhaseDurationHistogramName:                   "ms",
 	BuildStepDurationHistogramName:                    "ms",

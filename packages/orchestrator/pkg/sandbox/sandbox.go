@@ -292,6 +292,25 @@ type Sandbox struct {
 
 	updateMu sync.Mutex
 
+	// fphMu serialises free-page-hinting runs (the pre-pause drain and the
+	// periodic hinter): FC accepts one hinting cycle at a time, and Pause takes
+	// it as a barrier so no cycle survives into the snapshot.
+	fphMu sync.Mutex
+	// fphObserve and fphObserveFreed, when set (tests only), receive every
+	// recorded hinting outcome as "phase:outcome" (stops as "stop:outcome")
+	// with its duration, and every freed-bytes delta with its phase.
+	fphObserve       func(outcome string, took time.Duration)
+	fphObserveFreed  func(phase string, bytes uint64)
+	fphObserveFaults func(kind, window, outcome string, n int64)
+	// stopping is set before the checks are cancelled on the stop path: the
+	// hinter then lets the dying process take its cycle with it.
+	stopping atomic.Bool
+	// hintUnresponsive is latched by the periodic hinter when the guest sits
+	// out consecutive runs; it lives and dies with the loop. hintWarned
+	// dedupes the hinter's failure logs between completed runs.
+	hintUnresponsive atomic.Bool
+	hintWarned       atomic.Bool
+
 	// LifecycleID is a unique identifier for each Firecracker process.
 	// It is used internally by the orchestrator for map eviction guards
 	// and proxy connection pooling. Unlike ExecutionID (which is stable
@@ -319,6 +338,9 @@ type Sandbox struct {
 	// Pause/CreateSnapshot/ResumeInPlace on the same FC process. See
 	// Server.checkpointInPlace.
 	inPlaceCheckpointInFlight atomic.Bool
+	// lastCheckpointEndedAt (unix nanos) marks the end of the last in-place
+	// checkpoint: the periodic hinter stays quiet for QuietAfterStart after it.
+	lastCheckpointEndedAt atomic.Int64
 
 	// useSyncWP records whether this sandbox was resumed with synchronous
 	// userfault write-protect delivery (use_sync_wp on snapshot load). Only
@@ -326,6 +348,10 @@ type Sandbox struct {
 	// Written once during resume, before the sandbox is published; read-only
 	// afterwards (see UseSyncWP).
 	useSyncWP bool
+
+	// balloonMode is the balloon's free-page mechanism, read from Firecracker
+	// once the process is up (labelBalloonMode); unknown until then.
+	balloonMode atomic.Uint32
 
 	Template template.Template
 
@@ -432,6 +458,7 @@ func (s *Sandbox) BeginInPlaceCheckpoint() bool {
 
 // EndInPlaceCheckpoint clears the in-flight marker set by BeginInPlaceCheckpoint.
 func (s *Sandbox) EndInPlaceCheckpoint() {
+	s.lastCheckpointEndedAt.Store(time.Now().UnixNano())
 	s.inPlaceCheckpointInFlight.Store(false)
 }
 
@@ -1010,6 +1037,9 @@ func (f *Factory) CreateSandbox(
 	})
 
 	freePageHinting := fc.FCSupportsFreePageHinting(config.FirecrackerConfig.FirecrackerVersion) && config.FreePageHinting
+	// A boot's balloon is whatever it is configured with here; a cold-booted
+	// resume configures none.
+	sbx.setBalloonMode(balloonModeOf(fc.BalloonCaps{Reporting: config.FreePageReporting, Hinting: freePageHinting}))
 
 	err = fcHandle.Create(
 		ctx,
@@ -1565,6 +1595,12 @@ func (f *Factory) ResumeSandbox(
 		// of the per-resume KPI histograms (see WaitForEnvd).
 		skipStartupMetrics: !ropts.describesCustomerStart(),
 	}
+	// Known before the VM starts for templates built with the field, so the
+	// resume working set is labelled; older templates are labelled by
+	// labelBalloonMode once the process is up.
+	if meta.Balloon != nil {
+		sbx.setBalloonMode(balloonModeOf(fc.BalloonCaps{Reporting: meta.Balloon.Reporting, Hinting: meta.Balloon.Hinting}))
+	}
 
 	useMemfd := fc.FCSupportsMemfd(config.FirecrackerConfig.FirecrackerVersion) &&
 		f.featureFlags.BoolFlag(ctx, featureflags.UseMemFdFlag, sandboxLDContext(runtime, config))
@@ -1801,6 +1837,7 @@ func (s *Sandbox) doStop(ctx context.Context) error {
 	var errs []error
 
 	// Stop the health checks before stopping the sandbox
+	s.stopping.Store(true)
 	s.Checks.Stop()
 
 	fcStopErr := s.process.Stop(ctx)
@@ -1835,8 +1872,13 @@ func (s *Sandbox) Shutdown(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "shutdown sandbox")
 	defer span.End()
 
-	// Stop the health check before pausing the VM
+	// Stop the health check before pausing the VM; the barrier lets a hinting
+	// run in flight stop its cycle first, as in Pause.
 	s.Checks.Stop()
+	_, hintBarrier := tracer.Start(ctx, "wait for hinting run")
+	s.fphMu.Lock()
+	s.fphMu.Unlock() //nolint:staticcheck // barrier: acquire-release is the point
+	hintBarrier.End()
 
 	if err := s.process.Pause(ctx); err != nil {
 		return fmt.Errorf("failed to pause VM: %w", err)
@@ -1940,6 +1982,7 @@ func (s *Sandbox) Pause(
 
 	ctx, span := tracer.Start(ctx, "sandbox-snapshot", trace.WithAttributes(
 		attribute.Bool("fs-only-snapshot", pauseOpts.filesystemSnapshot),
+		attribute.String("balloon_mode", s.BalloonMode()),
 	))
 	defer span.End()
 
@@ -1995,6 +2038,12 @@ func (s *Sandbox) Pause(
 
 	// Stop the health check before pausing the VM
 	s.Checks.Stop()
+	// Wait out a periodic hinting run that already held the mutex: it stops the
+	// guest cycle before releasing, so nothing hints past this point.
+	_, hintBarrier := tracer.Start(ctx, "wait for hinting run")
+	s.fphMu.Lock()
+	s.fphMu.Unlock() //nolint:staticcheck // barrier: acquire-release is the point
+	hintBarrier.End()
 
 	// Best-effort pre-pause guest reclaim (fstrim, sync, drop_caches,
 	// compact_memory) on the live VM via envd. Per-step caps are LD-flag-driven;
@@ -2049,15 +2098,16 @@ func (s *Sandbox) Pause(
 	// Persist whether the rootfs was frozen so a later feature can safely decide
 	// this snapshot is one it may cold-boot / rewrite without journal repair.
 	m = m.MarkFsQuiesced(pauseOpts.filesystemSnapshot && frozen)
+	// Device truth over lineage: a cold-booted sandbox has no balloon whatever
+	// its template was built with, and its snapshots must say so.
+	if mode := userfaultfd.BalloonMode(s.balloonMode.Load()); mode != userfaultfd.BalloonModeUnknown {
+		m = m.WithBalloon(mode == userfaultfd.BalloonModeReporting, mode == userfaultfd.BalloonModeHinting)
+	}
 
 	// Drain free-page-hinting before pause so the snapshot doesn't capture
-	// pages the guest already considers free. Timeout per use case; 0 disables.
-	if t := featureflags.GetFreePageHintingTimeout(ctx, s.featureFlags, string(useCase), sandboxLDContext(s.Runtime, s.Config)); t > 0 {
-		drainCtx, cancel := context.WithTimeout(ctx, t)
-		if err := s.process.DrainBalloon(drainCtx); err != nil {
-			telemetry.ReportError(ctx, "balloon hinting drain failed (continuing pause)", err)
-		}
-		cancel()
+	// pages the guest already considers free. Budget per use case; 0 disables.
+	if cfg := featureflags.GetPrePauseHintConfig(ctx, s.featureFlags, string(useCase), sandboxLDContext(s.Runtime, s.Config)); cfg.Timeout > 0 {
+		s.prePauseHintDrain(ctx, cfg, s.process)
 	}
 
 	// For an in-place checkpoint the VM must come back up even if the snapshot

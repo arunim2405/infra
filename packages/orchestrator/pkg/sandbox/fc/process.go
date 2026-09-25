@@ -169,9 +169,19 @@ type Process struct {
 
 	client *apiClient
 
+	// hintCmd is the command id of the last hinting cycle this process
+	// started, and hintGuestSeen the last guest_cmd a cycle observed; the
+	// stop's acknowledgement wait keys on them.
+	hintCmd       atomic.Int64
+	hintGuestSeen atomic.Int64
+	hintSeenInit  atomic.Bool
+	balloonCaps   atomic.Pointer[BalloonCaps]
+
 	// balloonAccum is the cumulative virtio-balloon snapshot summed by the
-	// metrics-reader goroutine (FC's SharedIncMetric resets per flush).
-	balloonAccum atomic.Pointer[BalloonMetricsSnapshot]
+	// metrics-reader goroutine (FC's SharedIncMetric resets per flush);
+	// metricsLineMs is the utc_timestamp_ms of the last line it ingested.
+	balloonAccum  atomic.Pointer[BalloonMetricsSnapshot]
+	metricsLineMs atomic.Int64
 }
 
 func validateFirecrackerBinary(versions Config, config cfg.BuilderConfig) error {
@@ -798,9 +808,47 @@ func (p *Process) Pause(ctx context.Context) error {
 	return p.client.pauseVM(ctx)
 }
 
-// freePageHintDone is FC's FREE_PAGE_HINT_DONE: the host_cmd value FC writes
-// back after the guest's FREE_PAGE_HINT_STOP when start used acknowledge_on_stop.
-const freePageHintDone int64 = 1
+const (
+	// freePageHintStop is FC's FREE_PAGE_HINT_STOP: what the guest writes back
+	// when it has finished or been stopped, and what an idle guest reads as.
+	freePageHintStop int64 = 0
+	// freePageHintDone is FC's FREE_PAGE_HINT_DONE: the host_cmd value FC writes
+	// back after the guest's FREE_PAGE_HINT_STOP when start used acknowledge_on_stop.
+	freePageHintDone int64 = 1
+	// freePageHintFirstCmd is the lowest id FC assigns to a cycle: 0 and 1 are
+	// reserved for STOP and DONE, so any host_cmd or guest_cmd at or above it
+	// names a real cycle.
+	freePageHintFirstCmd int64 = 2
+	// hintConfigReadTimeout bounds the config read that classifies a start
+	// refusal. It must not inherit a drain deadline the start already spent.
+	hintConfigReadTimeout = 500 * time.Millisecond
+)
+
+// BalloonCaps is what the balloon device was installed with. Both false when
+// no balloon is installed.
+type BalloonCaps struct {
+	Reporting bool
+	Hinting   bool
+}
+
+// BalloonCaps reads the balloon config once for both free-page mechanisms.
+// Device truth is fixed at boot, so a successful read is kept for the process.
+func (p *Process) BalloonCaps(ctx context.Context) (BalloonCaps, error) {
+	if caps := p.balloonCaps.Load(); caps != nil {
+		return *caps, nil
+	}
+	cfg, err := p.client.describeBalloonConfig(ctx)
+	if err != nil {
+		return BalloonCaps{}, err
+	}
+	caps := BalloonCaps{}
+	if cfg != nil {
+		caps = BalloonCaps{Reporting: cfg.FreePageReporting, Hinting: cfg.FreePageHinting}
+	}
+	p.balloonCaps.Store(&caps)
+
+	return caps, nil
+}
 
 // BalloonFreePageReporting reports whether this VM's balloon device runs
 // continuous free-page reporting. Boot-time device truth straight from FC:
@@ -830,8 +878,41 @@ func (p *Process) ResumeFreePageReporting(ctx context.Context) error {
 	return p.client.resumeFreePageReporting(ctx)
 }
 
+// ErrHintingNotConfigured means the VM has no balloon, or its balloon was installed
+// without free-page hinting. Callers that only want a best-effort drain treat
+// it as a no-op; the periodic hinter exits on it.
+var ErrHintingNotConfigured = errors.New("balloon free-page hinting not configured")
+
+// ErrHintingInFlight wraps a DrainBalloon failure after which the guest may
+// still be hinting: the cycle started and was not confirmed done, or the start
+// round-trip itself ended in a context error and FC may have applied it. The
+// caller must StopBalloonHinting before anything else starts a cycle or
+// snapshots.
+var ErrHintingInFlight = errors.New("balloon hinting cycle possibly in flight")
+
+// ErrHintingStartRefused wraps a 400 from the start on a balloon that does have
+// hinting (the guest has not activated the device yet), or whose config could
+// not be read in time. The cycle did not start.
+var ErrHintingStartRefused = errors.New("balloon hinting start refused")
+
+// ErrHintingConfigUnknown additionally qualifies a refusal whose config read
+// failed: the refusal says nothing about the guest until the config is read.
+var ErrHintingConfigUnknown = errors.New("balloon config unreadable")
+
+// ErrHintingGuestSilent qualifies an ErrHintingInFlight timeout: the guest
+// never echoed the cycle's command, so it is not hinting slowly, it is not
+// hinting at all (no driver, feature not negotiated, balloon never activated).
+var ErrHintingGuestSilent = errors.New("guest did not engage in the hinting cycle")
+
+// ErrHintingStopUnacked means the stop reached FC but a guest that had engaged in
+// the cycle had not written its FREE_PAGE_HINT_STOP back before ctx ended. No
+// further discard can land, but that late stop may acknowledge the next cycle
+// as done before it ran.
+var ErrHintingStopUnacked = errors.New("balloon hinting stop not acknowledged by guest")
+
 // DrainBalloon triggers a free-page-hinting run and blocks until the cycle
-// completes or ctx fires. No-op on FC < v1.14 and when no balloon is configured.
+// completes or ctx fires. ErrHintingNotConfigured when the balloon cannot hint,
+// a Firecracker without the hinting API included.
 func (p *Process) DrainBalloon(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "drain-balloon")
 	outcome := "ok"
@@ -843,14 +924,58 @@ func (p *Process) DrainBalloon(ctx context.Context) error {
 	if !FCSupportsFreePageHinting(p.Versions.FirecrackerVersion) {
 		outcome = "fc-unsupported"
 
-		return nil
+		return fmt.Errorf("%w: firecracker %s", ErrHintingNotConfigured, p.Versions.FirecrackerVersion)
 	}
 
+	// A balloon without hinting answers nothing useful to any of the calls
+	// below; the cached config settles it without a request.
+	if caps, err := p.BalloonCaps(ctx); err == nil && !caps.Hinting {
+		outcome = "not-configured"
+
+		return ErrHintingNotConfigured
+	}
+
+	// Unknown until a status read shows it: a start that times out may have
+	// landed with an id this process has not seen.
+	p.hintCmd.Store(0)
+	if !p.hintSeenInit.Load() {
+		// guest_cmd travels with the snapshot: what the guest last wrote in
+		// some earlier life must not read as engagement in this one. Retried
+		// on the next run if the read fails.
+		if st, err := p.client.describeBalloonHinting(ctx); err == nil {
+			p.hintGuestSeen.Store(st.guestCmd)
+			p.hintSeenInit.Store(true)
+		}
+	}
 	if err := p.client.startBalloonHinting(ctx, true); err != nil {
 		if _, ok := errors.AsType[*operations.StartBalloonHintingBadRequest](err); ok {
-			outcome = "not-configured"
+			// FC answers 400 both for "no hinting on this balloon" and for a
+			// balloon the guest has not activated; only the device config says
+			// which it was.
+			cfgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hintConfigReadTimeout)
+			caps, cfgErr := p.BalloonCaps(cfgCtx)
+			cancel()
+			configured := caps.Hinting
+			switch {
+			case cfgErr != nil:
+				// The one certain fact is that no cycle started.
+				outcome = "start-refused-config-unknown"
 
-			return nil
+				return fmt.Errorf("%w: %w: %w", ErrHintingStartRefused, ErrHintingConfigUnknown, errors.Join(err, cfgErr))
+			case !configured:
+				outcome = "not-configured"
+
+				return ErrHintingNotConfigured
+			}
+			outcome = "start-refused"
+
+			return fmt.Errorf("%w: %w", ErrHintingStartRefused, err)
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// The request may have reached FC before the context ended.
+			outcome = "start-uncertain"
+
+			return fmt.Errorf("%w: start balloon hinting: %w", ErrHintingInFlight, err)
 		}
 
 		outcome = "start-failed"
@@ -858,36 +983,144 @@ func (p *Process) DrainBalloon(ctx context.Context) error {
 		return fmt.Errorf("start balloon hinting: %w", err)
 	}
 
-	if err := pollFphDone(ctx, p.client.describeBalloonHinting); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			outcome = "timeout"
-		} else {
+	// A status read while the cycle runs carries its command id; the guest
+	// echoes it back as guest_cmd once it starts hinting, which is how a slow
+	// guest is told apart from one that will never answer.
+	var cmd int64
+	engaged := false
+	err := p.pollHinting(ctx, func(st hintingStatus) bool {
+		p.hintGuestSeen.Store(st.guestCmd)
+		if cmd == 0 && st.hostCmd >= freePageHintFirstCmd {
+			cmd = st.hostCmd
+			p.hintCmd.Store(cmd)
+		}
+		engaged = engaged || (cmd >= freePageHintFirstCmd && st.guestCmd == cmd)
+
+		return st.hostCmd == freePageHintDone
+	})
+	if err != nil {
+		switch {
+		case !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
 			outcome = "describe-failed"
+		case engaged || cmd == 0:
+			// A budget spent on the start itself says nothing about the guest.
+			outcome = "timeout"
+		default:
+			outcome = "timeout-guest-silent"
+			err = fmt.Errorf("%w: %w", ErrHintingGuestSilent, err)
 		}
 
-		return err
+		return fmt.Errorf("%w: %w", ErrHintingInFlight, err)
 	}
 
 	return nil
 }
 
-func pollFphDone(ctx context.Context, describe func(ctx context.Context) (int64, error)) error {
+// StopBalloonHinting ends an in-flight hinting cycle. FC publishes
+// FREE_PAGE_HINT_DONE synchronously and skips any chain the guest still sends
+// for the old command, so once the stop lands no further discard can land.
+// FC's done-acknowledgement is not scoped to a command, though: a guest stop
+// arriving after the next start would mark that cycle done before it ran. So
+// this then waits for the guest's side of the handshake. guest_cmd is sticky
+// (it still reads the previous cycle's STOP until the guest echoes the new
+// command), so a guest that has echoed the command is waited for until ctx
+// ends, and one that has not is given ackGrace to do so before it is taken to
+// have never read it. A 400 (hinting not enabled, device not active) means
+// nothing was running. Needed because a second start restarts a cycle rather
+// than refusing it.
+func (p *Process) StopBalloonHinting(ctx context.Context, ackGrace time.Duration) error {
+	if !FCSupportsFreePageHinting(p.Versions.FirecrackerVersion) {
+		return nil
+	}
+	if err := p.client.stopBalloonHinting(ctx); err != nil {
+		if errors.Is(err, errHintingStopRefused) {
+			return nil
+		}
+
+		return fmt.Errorf("stop balloon hinting: %w", err)
+	}
+
+	// 0 when the start was never observed to land (its round-trip timed out);
+	// then any command the guest has echoed since the last one this process
+	// saw is this cycle's. guest_cmd is sticky, so an unchanged value is not.
+	cmd := p.hintCmd.Load()
+	// Without a baseline (the first read failed) a live-looking guest_cmd may
+	// be one persisted in the snapshot: only the grace applies.
+	seen, haveSeen := p.hintGuestSeen.Load(), p.hintSeenInit.Load()
+	grace := time.After(max(ackGrace, 0))
+	engaged := false
+	var last int64
+	err := p.pollHinting(ctx, func(st hintingStatus) bool {
+		last = st.guestCmd
+		p.hintGuestSeen.Store(st.guestCmd)
+		engaged = engaged || (st.guestCmd >= freePageHintFirstCmd && (st.guestCmd == cmd || (cmd == 0 && haveSeen && st.guestCmd != seen)))
+		if engaged {
+			return st.guestCmd == freePageHintStop
+		}
+		select {
+		case <-grace:
+			return true
+		default:
+			return false
+		}
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// The stop itself landed; only the acknowledgement is in doubt.
+			return fmt.Errorf("%w: guest_cmd=%d engaged=%t: %w", ErrHintingStopUnacked, last, engaged, err)
+		}
+
+		return fmt.Errorf("stop balloon hinting: acknowledgement poll: %w", err)
+	}
+
+	return nil
+}
+
+// HintFreedBytes is FC's cumulative free_page_hint_freed as of its last
+// metrics flush.
+func (p *Process) HintFreedBytes() uint64 {
+	return p.BalloonMetrics().HintFreed
+}
+
+// FlushHintFreedBytes asks FC to flush its metrics and returns the cumulative
+// free_page_hint_freed once the reader has ingested the flush. FC otherwise
+// flushes on a cadence of seconds, so the value read right after a run would
+// almost never include that run. On error the last observed value is returned
+// with the error.
+func (p *Process) FlushHintFreedBytes(ctx context.Context) (uint64, error) {
+	snap, err := p.FlushAndReadBalloonMetrics(ctx)
+
+	return snap.HintFreed, err
+}
+
+// pollHinting reads the hinting status with a short backoff until done
+// returns true or ctx ends; a status error ends it early.
+func (p *Process) pollHinting(ctx context.Context, done func(hintingStatus) bool) error {
 	backoff := 5 * time.Millisecond
 	for {
+		st, err := p.client.describeBalloonHinting(ctx)
+		if err != nil {
+			return fmt.Errorf("balloon hinting status: %w", err)
+		}
+		if done(st) {
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(backoff):
 		}
-
-		host, err := describe(ctx)
-		if err != nil {
-			return fmt.Errorf("balloon hinting status: %w", err)
-		}
-		if host == freePageHintDone {
-			return nil
-		}
 		backoff = min(backoff*2, 50*time.Millisecond)
+	}
+}
+
+// Exited reports whether the Firecracker process has already terminated.
+func (p *Process) Exited() bool {
+	select {
+	case <-p.Exit.Done():
+		return true
+	default:
+		return false
 	}
 }
 
