@@ -820,6 +820,51 @@ func (s *Server) recordExecutionDuration(ctx context.Context, sbx *sandbox.Sandb
 		metric.WithAttributes(attribute.String("stop_reason", string(sbx.GetStopReason()))))
 }
 
+// recordCrash reports an execution that ended with no stop reason. The cause
+// separates a guest that halted itself from a Firecracker somebody else
+// killed: both leave a nil wait error.
+func (s *Server) recordCrash(ctx context.Context, sbx *sandbox.Sandbox, waitErr error) {
+	exitInfo := sbx.FirecrackerExit()
+	cause := crashCause(exitInfo, sbx.MemoryHandlerErr())
+
+	s.sandboxCrashedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("cause", string(cause))))
+
+	fields := append(
+		[]zap.Field{zap.Error(waitErr), zap.String("crash_cause", string(cause))},
+		exitInfo.LogFields()...,
+	)
+
+	if isCleanFirecrackerExit(cause, waitErr) {
+		sbxlogger.I(sbx).Warn(ctx, "sandbox stopped without a stop reason", fields...)
+
+		return
+	}
+
+	sbxlogger.I(sbx).Error(ctx, "sandbox crashed", fields...)
+}
+
+// crashCause classifies an execution that ended with no stop reason. The
+// resume path stops Firecracker as soon as the memory handler exits, so a
+// signal we sent after the handler failed is that failure, not a missing stop
+// reason. Only requested_signal is overridden: a Firecracker killed from
+// outside can take the handler down with it.
+func crashCause(exit *fc.ExitInfo, memoryHandlerErr error) fc.CrashCause {
+	cause := fc.ClassifyExit(exit)
+	if cause == fc.CrashCauseRequestedSignal && memoryHandlerErr != nil {
+		return fc.CrashCauseMemoryHandlerFailed
+	}
+
+	return cause
+}
+
+// isCleanFirecrackerExit reports whether Firecracker exited 0 and nothing else
+// failed. That is usually the guest shutting down, but it includes guest
+// kernel panics and triple faults, which the host cannot tell apart. A wait
+// error means something else failed alongside the exit, so that stays a crash.
+func isCleanFirecrackerExit(cause fc.CrashCause, waitErr error) bool {
+	return cause == fc.CrashCauseCleanExit && waitErr == nil
+}
+
 // recordPauseAdmission records one admission decision. The wait histogram
 // samples only the outcomes that actually waited; an empty outcome (the
 // caller's context ended mid-wait) records nothing — no decision was made.
@@ -1733,7 +1778,7 @@ func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox
 		// A guest that dies cleanly leaves no wait error, so the log above
 		// misses it.
 		if sbx.GetStopReason() == sandbox.StopReasonCrashed {
-			sbxlogger.I(sbx).Error(ctx, "sandbox crashed", zap.Error(waitErr))
+			s.recordCrash(ctx, sbx, waitErr)
 		}
 
 		// Every ending — kill, pause, checkpoint hand-off, crash — passes here.

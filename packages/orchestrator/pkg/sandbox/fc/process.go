@@ -158,6 +158,15 @@ type Process struct {
 
 	Exit *utils.ErrorOnce
 
+	// exitInfo is how the leader was reaped. Published before Exit resolves,
+	// so anything woken by Exit reads a populated value.
+	exitInfo atomic.Pointer[ExitInfo]
+
+	// sentSignals has bit N set before Stop sends signal N. The reap matches
+	// the terminating signal against it: a zombie still accepts signals and
+	// the reap races Stop, so no single flag can be ordered against the death.
+	sentSignals atomic.Uint64
+
 	client *apiClient
 
 	// balloonAccum is the cumulative virtio-balloon snapshot summed by the
@@ -302,28 +311,9 @@ func (p *Process) configure(
 		defer stderrWriter.Close()
 		defer stdoutWriter.Close()
 
-		waitErr := p.cmd.Wait()
-		if waitErr != nil {
-			if exitErr, ok := errors.AsType[*exec.ExitError](waitErr); ok {
-				// Check if the process was killed by a signal
-				if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() && (status.Signal() == syscall.SIGKILL || status.Signal() == syscall.SIGTERM) {
-					p.Exit.SetError(nil)
-
-					return
-				}
-			}
-
-			logger.L().Error(ctx, "error waiting for fc process", zap.Error(waitErr))
-
-			errMsg := fmt.Errorf("error waiting for fc process: %w", waitErr)
-			p.Exit.SetError(errMsg)
-
-			cancelStart(errMsg)
-
-			return
+		if exitErr := p.handleExit(ctx, p.cmd.Wait()); exitErr != nil {
+			cancelStart(exitErr)
 		}
-
-		p.Exit.SetError(nil)
 	}()
 
 	// Wait for the FC process to start so we can use FC API
@@ -675,6 +665,52 @@ func (p *Process) Pid() (int, error) {
 	return p.cmd.Process.Pid, nil
 }
 
+// handleExit records how the reaped process ended and resolves Exit with the
+// error it returns. waitErr is what cmd.Wait returned.
+func (p *Process) handleExit(ctx context.Context, waitErr error) error {
+	// Record the status before resolving Exit: the branches below flatten a
+	// signalled kill and a clean exit into the same nil error.
+	if state := p.cmd.ProcessState; state != nil {
+		if status, ok := state.Sys().(syscall.WaitStatus); ok {
+			p.exitInfo.Store(exitInfoFromStatus(status, p.sentSignals.Load()))
+		}
+	}
+
+	if waitErr == nil {
+		p.Exit.SetError(nil)
+
+		return nil
+	}
+
+	if exitErr, ok := errors.AsType[*exec.ExitError](waitErr); ok {
+		// A signalled teardown is how a sandbox normally ends, so Exit
+		// resolves clean whether or not the signal was ours; ExitInfo carries
+		// the difference.
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() && (status.Signal() == syscall.SIGKILL || status.Signal() == syscall.SIGTERM) {
+			p.Exit.SetError(nil)
+
+			return nil
+		}
+	}
+
+	logger.L().Error(ctx, "error waiting for fc process", zap.Error(waitErr))
+
+	err := fmt.Errorf("error waiting for fc process: %w", waitErr)
+	p.Exit.SetError(err)
+
+	return err
+}
+
+// ExitInfo reports how the Firecracker leader was reaped, and nil before that.
+// Nil-safe: crash reporting runs for sandboxes that never got a process.
+func (p *Process) ExitInfo() *ExitInfo {
+	if p == nil {
+		return nil
+	}
+
+	return p.exitInfo.Load()
+}
+
 func (p *Process) Stop(ctx context.Context) error {
 	if p.cmd.Process == nil {
 		return errors.New("fc process not started")
@@ -702,7 +738,7 @@ func (p *Process) Stop(ctx context.Context) error {
 	ctx = context.WithoutCancel(ctx)
 
 	// On Linux >= 5.4, Go backs os.Process with pidfd, so Signal is safe against PID reuse.
-	err := p.cmd.Process.Signal(syscall.SIGTERM)
+	err := p.signal(syscall.SIGTERM)
 	if err != nil {
 		if errors.Is(err, os.ErrProcessDone) {
 			logger.L().Info(ctx, "fc process already exited", logger.WithSandboxID(p.files.SandboxID))
@@ -720,7 +756,7 @@ func (p *Process) Stop(ctx context.Context) error {
 	case <-p.Exit.Done():
 		return nil
 	case <-termDeadline.C:
-		killErr := p.cmd.Process.Kill()
+		killErr := p.signal(syscall.SIGKILL)
 		if killErr == nil {
 			logger.L().Info(ctx, "sent SIGKILL to fc process because it was not responding to SIGTERM for 10 seconds",
 				logger.WithSandboxID(p.files.SandboxID),
@@ -745,6 +781,14 @@ func (p *Process) Stop(ctx context.Context) error {
 			return fmt.Errorf("fc process %d still exists after SIGKILL", pid)
 		}
 	}
+}
+
+// signal records sig as sent before sending it, so a reap that our signal
+// causes always sees the record.
+func (p *Process) signal(sig syscall.Signal) error {
+	p.sentSignals.Or(signalBit(sig))
+
+	return p.cmd.Process.Signal(sig)
 }
 
 func (p *Process) Pause(ctx context.Context) error {

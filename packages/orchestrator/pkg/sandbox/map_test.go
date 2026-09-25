@@ -4,9 +4,7 @@ package sandbox
 
 import (
 	"context"
-	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -667,33 +665,12 @@ func keysOf(m map[string]int64) []string {
 	return out
 }
 
-// unstoppedLogs counts the traceable lines logged for one sandbox id. The observer
-// is process-wide too, so the id is what separates one test's line from another's.
-func unstoppedLogs(sandboxID string) int {
-	n := 0
-	for _, e := range testLogObserver.FilterMessage("sandbox lifecycle ended with no explicit stop").All() {
-		for _, f := range e.Context {
-			if f.Key == "sandbox.id" && f.String == sandboxID {
-				n++
-			}
-		}
-	}
-
-	return n
-}
-
-// testSandboxSeq numbers the sandboxes these tests build so each one's id is unique
-// to its invocation. t.Name() would not do: it repeats under -count, and the log
-// observer accumulates for the whole binary.
-var testSandboxSeq atomic.Uint64
-
-// testTypedMapSandbox is testMapSandbox with a sandbox id unique to this call and an
-// explicit sandbox type — the two things the counter and its log line report.
+// testTypedMapSandbox is testMapSandbox with an explicit sandbox type, which the
+// counter reports.
 func testTypedMapSandbox(t *testing.T, lifecycleID string, sandboxType sandboxtypes.SandboxType) *Sandbox {
 	t.Helper()
 
 	sbx := testMapSandbox(t, lifecycleID)
-	sbx.Runtime.SandboxID = fmt.Sprintf("sbx-%d", testSandboxSeq.Add(1))
 	sbx.Runtime.SandboxType = sandboxType
 
 	return sbx
@@ -760,9 +737,6 @@ func TestSandboxCloseReclaimsLiveEntryInTheCleanupChain(t *testing.T) {
 		string(sandboxtypes.SandboxTypeSandbox): 1,
 		string(sandboxtypes.SandboxTypeBuild):   0,
 	}, unstoppedDelta(t, before))
-
-	assert.Equal(t, 1, unstoppedLogs(sbx.Runtime.SandboxID),
-		"one customer increment must be traceable to the sandbox that caused it")
 }
 
 // An operation-initiated stop — delete, pause, a checkpoint that resumes fresh —
@@ -800,9 +774,6 @@ func TestSandboxCloseDoesNotReclaimAnEntryAnOperationAlreadyTook(t *testing.T) {
 		string(sandboxtypes.SandboxTypeSandbox): 0,
 		string(sandboxtypes.SandboxTypeBuild):   0,
 	}, unstoppedDelta(t, before))
-
-	assert.Zero(t, unstoppedLogs(sbx.Runtime.SandboxID),
-		"an operation-initiated stop must not log the unstopped line either")
 }
 
 // Several drivers can call Close for one lifecycle — the lifecycle goroutine, the
@@ -873,16 +844,13 @@ func TestSandboxCloseTwiceCountsOnce(t *testing.T) {
 		string(sandboxtypes.SandboxTypeSandbox): 1,
 		string(sandboxtypes.SandboxTypeBuild):   0,
 	}, unstoppedDelta(t, before))
-	assert.Equal(t, 1, unstoppedLogs(sbx.Runtime.SandboxID))
 }
 
 // A build layer boot ends exactly like a crash does — nothing in the build tree
 // marks a sandbox stopping, and every successful layer reaches the branch. The
 // population has to be visible, or a build tree that stopped reaching it would
-// read the same as a healthy one; and it has to be visible in the metric only,
-// because at one log line per layer it would bury the customer lines it shares a
-// message with.
-func TestSandboxCloseCountsABuildLifecycleWithoutLoggingIt(t *testing.T) {
+// read the same as a healthy one.
+func TestSandboxCloseCountsABuildLifecycle(t *testing.T) {
 	t.Parallel()
 	serializeUnstoppedCounter(t)
 
@@ -898,16 +866,11 @@ func TestSandboxCloseCountsABuildLifecycleWithoutLoggingIt(t *testing.T) {
 		string(sandboxtypes.SandboxTypeSandbox): 0,
 		string(sandboxtypes.SandboxTypeBuild):   1,
 	}, unstoppedDelta(t, before))
-
-	assert.Zero(t, unstoppedLogs(sbx.Runtime.SandboxID),
-		"the build population is observable in the metric, not in the log")
 }
 
 // SandboxType's zero value is reachable: the resume-build and benchmark harnesses
-// build RuntimeMetadata without it. String() maps it to "sandbox", and the label
-// and the log gate read that one normalized local — so an unset type joins the
-// customer series and is logged like one, rather than opening a third series or
-// being counted as a customer and refused by the gate.
+// build RuntimeMetadata without it. String() maps it to "sandbox", so an unset
+// type joins the customer series rather than opening a third one.
 func TestSandboxCloseCountsAnUnsetTypeAsACustomerSandbox(t *testing.T) {
 	t.Parallel()
 	serializeUnstoppedCounter(t)
@@ -924,9 +887,6 @@ func TestSandboxCloseCountsAnUnsetTypeAsACustomerSandbox(t *testing.T) {
 		string(sandboxtypes.SandboxTypeSandbox): 1,
 		string(sandboxtypes.SandboxTypeBuild):   0,
 	}, unstoppedDelta(t, before))
-
-	assert.Equal(t, 1, unstoppedLogs(sbx.Runtime.SandboxID),
-		"the log gate and the attribute must agree on an unset type")
 }
 
 // An in-place checkpoint never marks the entry stopping — that is the point of it
@@ -953,11 +913,6 @@ func TestSandboxCloseCountsAnOrchestratorTeardownThatSkippedTheMark(t *testing.T
 		string(sandboxtypes.SandboxTypeSandbox): 1,
 		string(sandboxtypes.SandboxTypeBuild):   0,
 	}, unstoppedDelta(t, before))
-
-	// The line names the sandbox, which is where an investigation starts; it does
-	// not say which of the three teardowns this was, and neither does the counter.
-	assert.Equal(t, 1, unstoppedLogs(sbx.Runtime.SandboxID),
-		"an orchestrator-chosen teardown is logged like any other customer lifecycle")
 }
 
 // A lifecycle that never became live has no entry to reclaim: the reboot path
@@ -981,7 +936,6 @@ func TestSandboxCloseWithoutALiveEntryCountsNothing(t *testing.T) {
 		string(sandboxtypes.SandboxTypeSandbox): 0,
 		string(sandboxtypes.SandboxTypeBuild):   0,
 	}, unstoppedDelta(t, before))
-	assert.Zero(t, unstoppedLogs(sbx.Runtime.SandboxID))
 
 	// The same Close against a live entry: the counted branch returns the same
 	// value, so no error was introduced on either side of the boolean.

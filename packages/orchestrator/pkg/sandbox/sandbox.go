@@ -1745,6 +1745,28 @@ func (s *Sandbox) Wait(ctx context.Context) error {
 	return s.exit.WaitWithContext(ctx)
 }
 
+// FirecrackerExit reports how the Firecracker process ended, and nil until it
+// is reaped. Only meaningful once the execution has ended.
+func (s *Sandbox) FirecrackerExit() *fc.ExitInfo {
+	return s.process.ExitInfo()
+}
+
+// MemoryHandlerErr reports why the memory handler exited, and nil if it has
+// not exited or exited cleanly. Only meaningful once the execution has ended.
+func (s *Sandbox) MemoryHandlerErr() error {
+	if s.Resources == nil || s.memory == nil {
+		return nil
+	}
+
+	exit := s.memory.Exit()
+	select {
+	case <-exit.Done():
+		return exit.Error()
+	default:
+		return nil
+	}
+}
+
 func (s *Sandbox) Close(ctx context.Context) error {
 	// The live-map entry is reclaimed inside the chain, by the callback
 	// Map.reclaimLiveEntryOnCleanup registers. Close must not reclaim it here:

@@ -54,6 +54,14 @@ const (
 	OrchestratorHostBalanceDirtyPagesThreads CounterType = "orchestrator.host.balance_dirty_pages.threads"
 
 	OrchestratorSandboxKilledCounterName CounterType = "orchestrator.sandbox.killed"
+	// OrchestratorSandboxCrashedCounterName counts sandbox executions that
+	// ended with no recorded stop reason, labeled by cause. external_signal,
+	// a kill the orchestrator did not send, is the one to alert on.
+	// memory_handler_failed is a resumed sandbox whose memory could not be
+	// served, hugepage exhaustion included; fault is Firecracker faulting.
+	// clean_exit is usually the guest shutting down, but also covers guest
+	// kernel panics, which the host cannot tell apart.
+	OrchestratorSandboxCrashedCounterName CounterType = "orchestrator.sandbox.crashed"
 	// OrchestratorSandboxPauseAdmissionCounterName counts every snapshot-
 	// admission decision. refused is the told-the-caller-to-retry rate;
 	// ready_after_wait counts the grace paying off — their ratio tunes the
@@ -624,6 +632,7 @@ var counterDesc = map[CounterType]string{
 	EnvdInitCalls:                                "Number of envd initialization calls",
 	EnvdCollapseChunks:                           "2 MiB chunks the pre-pause envd heap collapse attempted, by result",
 	OrchestratorSandboxKilledCounterName:         "Number of sandboxes killed, labeled by kill reason",
+	OrchestratorSandboxCrashedCounterName:        "Sandbox executions that ended without a recorded stop reason, labeled by cause (clean_exit/exit_error/external_signal/fault/memory_handler_failed/requested_signal/unknown)",
 	OrchestratorSandboxPauseAdmissionCounterName: "Snapshot-admission decisions, labeled by outcome (ready/ready_after_wait/refused/latched_error) and rpc (pause/checkpoint)",
 	OrchestratorSandboxCheckpointCounterName:     "Number of sandbox checkpoints taken, labeled by in_place and success",
 	OrchestratorFPRResumeCounterName:             "Free-page-reporting resumes after a CoW window, labeled by outcome (inline, retry, fenced, fc_exited, abandoned)",
@@ -690,6 +699,7 @@ var counterUnits = map[CounterType]string{
 	EnvdInitCalls:                                "1",
 	EnvdCollapseChunks:                           "{chunk}",
 	OrchestratorSandboxKilledCounterName:         "{sandbox}",
+	OrchestratorSandboxCrashedCounterName:        "{sandbox}",
 	OrchestratorSandboxPauseAdmissionCounterName: "{decision}",
 	OrchestratorSandboxCheckpointCounterName:     "{checkpoint}",
 	OrchestratorFPRResumeCounterName:             "{resume}",

@@ -11,7 +11,6 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
@@ -288,8 +287,7 @@ func (m *Map) MarkStopping(ctx context.Context, sandboxID, lifecycleID string) b
 // return clears asynchronously and well after this chain ends. Do not move this
 // call.
 //
-// sandboxType is carried only so the counter below can report it; nothing here
-// branches on it except the log gate, which reads the same normalized local.
+// sandboxType is carried only so the counter below can report it.
 func (m *Map) reclaimLiveEntryOnCleanup(ctx context.Context, cleanup *Cleanup, sandboxID, lifecycleID string, sandboxType sandboxtypes.SandboxType) {
 	cleanup.Add(ctx, func(ctx context.Context) error {
 		// false is the normal outcome: delete, pause and a checkpoint that resumes
@@ -313,26 +311,10 @@ func (m *Map) reclaimLiveEntryOnCleanup(ctx context.Context, cleanup *Cleanup, s
 		// not a race against a live guest.
 		//
 		// String() maps the zero value to "sandbox", so an unset type joins the
-		// customer series rather than opening a third, unnamed one. The attribute
-		// and the log gate below read this one local so they cannot disagree about
-		// which population a lifecycle is in.
+		// customer series rather than opening a third, unnamed one.
 		sbxType := sandboxType.String()
 
 		lifecycleUnstoppedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("sandbox_type", sbxType)))
-
-		// The counter covers both populations; the log covers only customers. Every
-		// successful build layer reaches this branch, so a line per build would
-		// report the expected outcome of a healthy build at build-boot rate and
-		// bury the customer lines it shares a message with. For customers the
-		// individual occurrence — not the rate — is the unit of investigation,
-		// which is what the line is for.
-		if sbxType == string(sandboxtypes.SandboxTypeSandbox) {
-			logger.L().Info(ctx, "sandbox lifecycle ended with no explicit stop",
-				logger.WithSandboxID(sandboxID),
-				logger.WithLifecycleID(lifecycleID),
-				zap.String("sandbox_type", sbxType),
-			)
-		}
 
 		return nil
 	})

@@ -84,6 +84,7 @@ type Server struct {
 	sandboxExecutionDuration metric.Int64Histogram
 	sandboxPauseDuration     metric.Int64Histogram
 	sandboxKilledCounter     metric.Int64Counter
+	sandboxCrashedCounter    metric.Int64Counter
 	sandboxCheckpointCounter metric.Int64Counter
 	uploadFailedCounter      metric.Int64Counter
 	envdUpgradeAttempts      metric.Int64Counter
@@ -177,6 +178,12 @@ func New(ctx context.Context, cfg ServiceConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to register sandbox kills counter: %w", err)
 	}
 	server.sandboxKilledCounter = sandboxKilledCounter
+
+	sandboxCrashedCounter, err := telemetry.GetCounter(meter, telemetry.OrchestratorSandboxCrashedCounterName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register sandbox crashes counter: %w", err)
+	}
+	server.sandboxCrashedCounter = sandboxCrashedCounter
 
 	sandboxCheckpointCounter, err := telemetry.GetCounter(meter, telemetry.OrchestratorSandboxCheckpointCounterName)
 	if err != nil {
