@@ -1436,6 +1436,7 @@ components:
         - concurrent_template_builds
         - events_ttl_days
         - default_free_disk_size_mb
+        - api_team_rps_list
       anyOf:
         - required: [max_free_disk_size_mb]
         - required: [max_disk_size_mb]
@@ -1506,6 +1507,13 @@ components:
             The same ceiling as max_free_disk_size_mb, under the name it was
             first published with. Kept until every deployed sender and receiver
             speaks the other name.
+        api_team_rps_list:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >-
+            Requests per second a project may make to each list endpoint. Zero
+            disables the limit.
 
 tags:
   - name: builds

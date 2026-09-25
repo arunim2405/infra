@@ -51,15 +51,6 @@ func TestAPIListRateResolvesTierAndActiveAddons(t *testing.T) {
 	assert.Equal(t, int64(10), resolved(teamID))
 	assert.Equal(t, int64(12), resolved(otherTeamID))
 
-	_, err = sqlDB.ExecContext(t.Context(), `
-		INSERT INTO public.project_limits (
-			team_id, max_length_hours, concurrent_sandboxes, concurrent_template_builds,
-			max_vcpu, max_ram_mb, disk_mb, events_ttl_days, default_free_disk_size_mb, max_disk_size_mb
-		) VALUES ($1, 1, 200, 20, 8, 8192, 10240, 7, 10240, 25600)
-	`, teamID)
-	require.NoError(t, err)
-	assert.Equal(t, int64(10), resolved(teamID))
-
 	const largeRPS int64 = 1 << 32
 	_, err = sqlDB.ExecContext(t.Context(), `UPDATE public.tiers SET api_team_rps_list = $1 WHERE id = 'base_v1'`, largeRPS)
 	require.NoError(t, err)
@@ -67,6 +58,17 @@ func TestAPIListRateResolvesTierAndActiveAddons(t *testing.T) {
 	_, err = sqlDB.ExecContext(t.Context(), `UPDATE public.addons SET extra_api_team_rps_list = $1 WHERE team_id = $2 AND name = 'active'`, largeRPS+1, teamID)
 	require.NoError(t, err)
 	assert.Equal(t, 2*largeRPS+4, resolved(teamID))
+
+	_, err = sqlDB.ExecContext(t.Context(), `
+		INSERT INTO public.project_limits (
+			team_id, max_length_hours, concurrent_sandboxes, concurrent_template_builds,
+			max_vcpu, max_ram_mb, disk_mb, events_ttl_days, default_free_disk_size_mb, max_disk_size_mb,
+			api_team_rps_list
+		) VALUES ($1, 1, 200, 20, 8, 8192, 10240, 7, 10240, 25600, 40)
+	`, teamID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(40), resolved(teamID), "a pushed rate replaces the tier and team add-on rate")
+	assert.Equal(t, largeRPS+7, resolved(otherTeamID), "another team's push does not reach this one")
 
 	_, err = sqlDB.ExecContext(t.Context(), `UPDATE public.tiers SET api_team_rps_list = -1 WHERE id = 'base_v1'`)
 	require.Error(t, err)

@@ -54,6 +54,7 @@ func (s *APIStore) ManagementUpsertProjectLimits(c *gin.Context, projectID api.P
 		EventsTTLDays:            int64(body.EventsTtlDays),
 		DefaultFreeDiskSizeMB:    body.DefaultFreeDiskSizeMb,
 		MaxFreeDiskSizeMB:        maxFreeDiskSizeMB,
+		APITeamRPSList:           body.ApiTeamRpsList,
 	}); err != nil {
 		s.sendProjectLimitsError(c, err, attrs...)
 

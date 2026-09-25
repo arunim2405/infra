@@ -192,3 +192,20 @@ func (r *routeRecorder) ManagementAssignProjectCluster(c *gin.Context, _ api.Pro
 func (r *routeRecorder) ManagementDetachProjectCluster(c *gin.Context, _ api.ProjectID, _ api.ClusterID) {
 	r.report(c, "detachProjectCluster")
 }
+
+// Zero disables the list rate limit, so a sender that leaves the rate out must be
+// refused by the request validator rather than decoded as zero.
+func TestProjectLimitsContractRequiresTheListRate(t *testing.T) {
+	t.Parallel()
+
+	swagger, err := api.GetSwagger()
+	require.NoError(t, err)
+	schema := swagger.Components.Schemas["ManagementProjectLimits"].Value
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal([]byte(validLimitsBody), &body))
+	require.NoError(t, schema.VisitJSON(body))
+
+	delete(body, "api_team_rps_list")
+	require.ErrorContains(t, schema.VisitJSON(body), "api_team_rps_list")
+}

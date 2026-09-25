@@ -112,10 +112,8 @@ The control-plane entry point (Gin, OpenAPI-generated from `spec/openapi.yml`, p
   already-matched operation and stores the API group directly in Gin's context. The rate limiter
   reads that group and maps it to a field in the authenticated team's limits. Grouped operations
   require team-identifying authentication; public operations do not populate an API group.
-  Group rates are stored in regional PostgreSQL tier and addon records; the `team_limits` view
-  combines the tier allowance with active addons, and authentication caches the resolved limits.
-  API-group rates are resolved regionally, independently of the `project_limits` push contract
-  for sandbox resource limits.
+  A group's rate is one of the team's limits and resolves with the rest of them through the
+  `team_limits` view, which authentication caches; it has no source of its own.
   A positive rate sets both requests per second and burst capacity. Redis enforces a separate
   budget for each team, HTTP method, and route template across API replicas: groups select
   rates, but routes do not share a budget. Exhausted budgets return HTTP 429 with rate-limit
